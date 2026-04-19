@@ -46,7 +46,7 @@ Start the tray app:
 python .\lmstudio_weight_watcher.py
 ```
 
-Use the launcher without activating Conda:
+Use the launcher:
 
 ```powershell
 .\run_watcher.bat
@@ -80,11 +80,10 @@ python .\lmstudio_weight_watcher.py --timeout-seconds 45 --tolerance-seconds 90
 
 - By default, the script discovers the models folder from `%APPDATA%\LM Studio\settings.json`.
 - It uses a 60 second tolerance window to avoid false positives from timestamp rounding or metadata lag.
-- Embedding models are skipped by default because LM Studio reports them differently. Regular chat and multimodal models still work.
 - Persistent watcher state is stored by default in `%APPDATA%\LM Studio Weight Watcher\state.json`.
 - Existing installs using the old `LM Studio Weight Updater` state path are still recognized automatically.
-- The launcher prefers `%LMSTUDIO_WATCHER_PYTHON%`, then `%USERPROFILE%\miniforge3\envs\weightupdater`, then `%USERPROFILE%\miniforge3`.
-- If the hidden launcher has to fall back to `pythonw` from `PATH`, it writes a note to `watcher-launch.log`.
+- The launcher first checks `%LMSTUDIO_WATCHER_PYTHON%`, then a local `.venv`, then `python`, then `py -3`.
+- If the hidden startup launcher cannot start the watcher, it writes the reason to `watcher-launch.log`.
 
 ## License
 

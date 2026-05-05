@@ -55,11 +55,21 @@ if not defined PYTHON_EXE if "%USE_PY_LAUNCHER%"=="0" (
     exit /b 1
 )
 
+set "ERR_LOG_PATH=%ROOT_DIR%watcher-error.log"
+
 pushd "%ROOT_DIR%" >nul
-if "%USE_PY_LAUNCHER%"=="1" (
-    py -3 "%SCRIPT_PATH%" %*
+if "%HIDDEN_LAUNCH%"=="1" (
+    if "%USE_PY_LAUNCHER%"=="1" (
+        py -3 "%SCRIPT_PATH%" %1 %2 %3 %4 %5 %6 %7 %8 %9 >>"%LOG_PATH%" 2>>"%ERR_LOG_PATH%"
+    ) else (
+        "%PYTHON_EXE%" "%SCRIPT_PATH%" %1 %2 %3 %4 %5 %6 %7 %8 %9 >>"%LOG_PATH%" 2>>"%ERR_LOG_PATH%"
+    )
 ) else (
-    "%PYTHON_EXE%" "%SCRIPT_PATH%" %*
+    if "%USE_PY_LAUNCHER%"=="1" (
+        py -3 "%SCRIPT_PATH%" %*
+    ) else (
+        "%PYTHON_EXE%" "%SCRIPT_PATH%" %*
+    )
 )
 set "EXIT_CODE=%ERRORLEVEL%"
 popd >nul

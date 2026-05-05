@@ -19,11 +19,7 @@ def default_state_path() -> Path:
     appdata = os.environ.get("APPDATA")
     if not appdata:
         return Path.cwd() / "lmstudio-weight-watcher-state.json"
-    preferred = Path(appdata) / APP_NAME / "state.json"
-    legacy = Path(appdata) / LEGACY_APP_NAME / "state.json"
-    if not preferred.is_file() and legacy.is_file():
-        return legacy
-    return preferred
+    return Path(appdata) / APP_NAME / "state.json"
 
 
 def blank_state() -> dict[str, Any]:

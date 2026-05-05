@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -179,7 +180,24 @@ def ensure_directory(path: Path) -> Path:
 
 
 def load_lms_json(arguments: list[str]) -> Any:
-    command = ["lms", *arguments]
+    lms_binary = "lms"
+    # Fallback for Windows if lms is not on PATH
+    if os.name == "nt":
+        if not shutil.which("lms"):
+            appdata = os.environ.get("APPDATA")
+            user_profile = os.environ.get("USERPROFILE")
+            candidates = []
+            if user_profile:
+                candidates.append(Path(user_profile) / ".cache" / "lm-studio" / "bin" / "lms.exe")
+            if appdata:
+                candidates.append(Path(appdata).parent / "Local" / ".cache" / "lm-studio" / "bin" / "lms.exe")
+
+            for candidate in candidates:
+                if candidate.is_file():
+                    lms_binary = str(candidate)
+                    break
+
+    command = [lms_binary, *arguments]
     try:
         completed = subprocess.run(
             command,
@@ -189,7 +207,7 @@ def load_lms_json(arguments: list[str]) -> Any:
             encoding="utf-8",
         )
     except FileNotFoundError as exc:
-        raise CheckerError("The `lms` CLI is not installed or not on PATH.") from exc
+        raise CheckerError(f"The `lms` CLI is not installed or not on PATH (tried '{lms_binary}').") from exc
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip() if exc.stderr else "unknown error"
         raise CheckerError(f"`{' '.join(command)}` failed: {stderr}") from exc
@@ -304,6 +322,38 @@ def resolve_model_entry(
                 quantization=((entry.get("quantization") or {}).get("name")),
             )
 
+    # Fallback: if the specific file is missing (e.g. renamed), check the directory
+    for candidate in candidates:
+        candidate_dir = models_root.joinpath(*candidate.local_relative_path.split("/")[:-1])
+        if candidate_dir.is_dir():
+            # Look for any .gguf file in this directory as a proxy
+            # Exclude partial downloads (.part, .tmp, .download)
+            files = [
+                f for f in candidate_dir.glob("*.gguf")
+                if f.suffix == ".gguf"
+            ]
+            if files:
+                # Use the one with the most recent mtime
+                best_file = max(files, key=lambda f: f.stat().st_mtime)
+                print(
+                    f"  note: resolved {require_string(entry, 'modelKey')} via "
+                    f"directory fallback -> {best_file.name}"
+                )
+                stat = best_file.stat()
+                return ResolvedModel(
+                    model_key=require_string(entry, "modelKey"),
+                    display_name=require_string(entry, "displayName"),
+                    publisher=require_string(entry, "publisher"),
+                    local_path=best_file,
+                    local_modified_utc=datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ),
+                    local_size_bytes=stat.st_size,
+                    remote_repo=candidate.repo,
+                    remote_file=candidate.remote_file,
+                    quantization=((entry.get("quantization") or {}).get("name")),
+                )
+
     model_key = require_string(entry, "modelKey")
     raise CheckerError(
         f"Could not resolve a local file for {model_key}. "
@@ -376,21 +426,47 @@ def get_remote_file_metadata(
     timeout_seconds: int,
     tree_cache: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
-    parent = ""
+    # Try root and subdirectories if needed
+    search_paths = [""]
     if "/" in remote_file:
-        parent = remote_file.rsplit("/", 1)[0]
+        search_paths.append(remote_file.rsplit("/", 1)[0])
 
-    cache_key = (repo, parent)
-    if cache_key not in tree_cache:
-        tree_cache[cache_key] = fetch_tree(repo, parent, timeout_seconds)
+    for parent in search_paths:
+        cache_key = (repo, parent)
+        if cache_key not in tree_cache:
+            try:
+                tree_cache[cache_key] = fetch_tree(repo, parent, timeout_seconds)
+            except CheckerError:
+                continue
 
-    file_entry = tree_cache[cache_key].get(remote_file)
-    if not file_entry:
-        raise CheckerError(
-            f"Could not find remote file metadata for {repo}/{remote_file}."
-        )
+        file_entry = tree_cache[cache_key].get(remote_file)
+        if file_entry:
+            return file_entry
 
-    return file_entry
+    # If still not found, try a flat search of the entire repo (first level folders)
+    # This helps when the file is in a folder like 'IQ4_XS' but the path is flat.
+    bare_name = remote_file.rsplit("/", 1)[-1] if "/" in remote_file else remote_file
+    root_key = (repo, "")
+    if root_key not in tree_cache:
+        tree_cache[root_key] = fetch_tree(repo, "", timeout_seconds)
+
+    for entry in tree_cache[root_key].values():
+        if entry.get("type") == "directory":
+            dir_name = entry["path"]
+            dir_key = (repo, dir_name)
+            if dir_key not in tree_cache:
+                try:
+                    tree_cache[dir_key] = fetch_tree(repo, dir_name, timeout_seconds)
+                except CheckerError:
+                    continue
+
+            file_entry = tree_cache[dir_key].get(f"{dir_name}/{bare_name}")
+            if file_entry:
+                return file_entry
+
+    raise CheckerError(
+        f"Could not find remote file metadata for {repo}/{remote_file}."
+    )
 
 
 def fetch_tree(repo: str, parent: str, timeout_seconds: int) -> dict[str, Any]:

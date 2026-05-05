@@ -1,7 +1,10 @@
 from __future__ import annotations  
   
-import argparse  
-import threading  
+import argparse
+import os
+import shutil
+import sys
+import threading
 from dataclasses import dataclass  
 from datetime import datetime, timedelta, timezone  
 from pathlib import Path  
@@ -11,17 +14,18 @@ from tkinter import ttk, font as tkfont
 import pystray  
 from PIL import Image, ImageDraw, ImageFont  
   
-from lmstudio_alert_state import (  
-    acknowledge_alerts,  
-    all_alerts,  
-    apply_results,  
-    default_state_path,  
-    load_state,  
-    pending_alerts,  
-    record_reminder,  
-    reminder_due,  
-    save_state,  
-    snooze_alerts,  
+from lmstudio_alert_state import (
+    LEGACY_APP_NAME,
+    acknowledge_alerts,
+    all_alerts,
+    apply_results,
+    default_state_path,
+    load_state,
+    pending_alerts,
+    record_reminder,
+    reminder_due,
+    save_state,
+    snooze_alerts,
 )  
 from lmstudio_weight_checker import (  
     CheckerError,  
@@ -111,29 +115,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()  
   
   
-def main() -> int:  
-    args = parse_args()  
-    state_path = (args.state_file or default_state_path()).expanduser()  
-  
-    if args.once:  
-        return run_once(  
-            state_path=state_path,  
-            models_root_override=args.models_root,  
+def main() -> int:
+    args = parse_args()
+    state_path = (args.state_file or default_state_path()).expanduser()
+
+    # Migration: if legacy exists and preferred doesn't, move it.
+    legacy_path = (Path(os.environ.get("APPDATA", "")) / LEGACY_APP_NAME / "state.json")
+    if not args.state_file and legacy_path.is_file() and not state_path.is_file():
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_path), str(state_path))
+            print(f"Migrated state from legacy location: {legacy_path} -> {state_path}")
+        except Exception as exc:
+            print(f"Could not migrate legacy state: {exc}")
+
+    if args.once:
+        return run_once(
+            state_path=state_path,
+            models_root_override=args.models_root,
             timeout_seconds=args.timeout_seconds,
             tolerance_seconds=args.tolerance_seconds,
-        )  
-  
-    app = WatcherApp(  
-        state_path=state_path,  
-        models_root_override=args.models_root,  
-        check_interval=timedelta(hours=args.check_interval_hours),  
-        reminder_interval=timedelta(minutes=args.reminder_interval_minutes),  
-        snooze_hours=args.snooze_hours,  
+        )
+
+    app = WatcherApp(
+        state_path=state_path,
+        models_root_override=args.models_root,
+        check_interval=timedelta(hours=args.check_interval_hours),
+        reminder_interval=timedelta(minutes=args.reminder_interval_minutes),
+        snooze_hours=args.snooze_hours,
         timeout_seconds=args.timeout_seconds,
         tolerance_seconds=args.tolerance_seconds,
-    )  
-    app.start()  
-    return 0  
+    )
+    try:
+        app.start()
+    except Exception as exc:
+        import traceback
+        error_msg = f"Application crashed at {datetime.now()}:\n{traceback.format_exc()}"
+        print(error_msg, file=sys.stderr)
+        return 1
+    return 0
   
   
 def run_once(

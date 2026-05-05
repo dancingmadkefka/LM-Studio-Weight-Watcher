@@ -14,6 +14,8 @@ env/
 # Local runtime state
 *.log
 lmstudio-weight-watcher-state.json
+inventory.json
+inventory_utf8.json
 
 # OS/editor noise
 .DS_Store

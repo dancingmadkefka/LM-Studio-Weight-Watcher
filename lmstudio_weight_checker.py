@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 DEFAULT_TIMEOUT_SECONDS = 30
-DEFAULT_TOLERANCE_SECONDS = 60
+HASH_CHUNK_SIZE = 8 * 1024 * 1024
 HF_API_ROOT = "https://huggingface.co/api/models"
+
+# Matches a sharded GGUF, e.g. "Model-Q4_K-00001-of-00002.gguf".
+SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
 
 
 @dataclass
@@ -27,16 +32,36 @@ class RemoteReference:
 
 
 @dataclass
-class ResolvedModel:
-    model_key: str
-    display_name: str
-    publisher: str
+class Artifact:
+    """One local file that belongs to an installed model.
+
+    A model is treated as a SET of artifacts (its weight shards plus, for a
+    vision model, any projector present on disk). Each artifact is compared
+    against its Hugging Face counterpart independently, because uploaders do not
+    always move shards or projectors as an atomic set.
+    """
+
+    kind: str            # "weight" | "projector"
+    label: str           # human label, e.g. "weights (shard 1/2)" or "projector"
     local_path: Path
-    local_modified_utc: datetime
-    local_size_bytes: int
     remote_repo: str
-    remote_file: str
-    quantization: str | None
+    remote_file: str     # path within the repo (basename for root-level files)
+
+
+@dataclass
+class ArtifactResult:
+    kind: str
+    label: str
+    status: str          # up-to-date | update-available | removed-remote | missing-local | unresolved
+    local_path: str | None
+    remote_file: str | None
+    local_size: int | None
+    remote_size: int | None
+    local_oid: str | None
+    remote_oid: str | None
+    last_commit_title: str | None
+    last_commit_date_utc: str | None
+    message: str
 
 
 @dataclass
@@ -52,10 +77,25 @@ class CheckResult:
     remote_modified_utc: str | None
     delta_seconds: float | None
     message: str | None = None
+    remote_sha256: str | None = None
+    local_sha256: str | None = None
+    hash_method: str | None = None
+    last_commit_title: str | None = None
+    artifacts: list = field(default_factory=list)
 
 
 class CheckerError(RuntimeError):
     """Raised when the checker cannot continue."""
+
+
+class RemoteFileMissing(CheckerError):
+    """Raised when a file is confirmed absent from Hugging Face.
+
+    Distinct from a transient ``CheckerError`` (timeout, auth, network): only a
+    confirmed absence (HTTP 404, or the file is absent from a tree we
+    successfully listed) qualifies, so the caller can safely classify it as
+    ``removed-remote`` instead of a transient ``unresolved``.
+    """
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,12 +132,12 @@ def parse_args() -> argparse.Namespace:
         help=f"HTTP timeout in seconds. Default: {DEFAULT_TIMEOUT_SECONDS}.",
     )
     parser.add_argument(
-        "--tolerance-seconds",
-        type=int,
-        default=DEFAULT_TOLERANCE_SECONDS,
+        "--hash-cache",
+        type=Path,
+        default=None,
         help=(
-            "Tolerance window before a remote file counts as newer. "
-            f"Default: {DEFAULT_TOLERANCE_SECONDS}."
+            "Path to the local-file sha256 cache (speeds up repeat checks). "
+            "Default: next to the Weight Watcher state file in APPDATA."
         ),
     )
     return parser.parse_args()
@@ -106,6 +146,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    hash_cache_path = args.hash_cache or default_hash_cache_path()
+    hash_cache = load_hash_cache(hash_cache_path)
     try:
         models_root = discover_models_root(args.models_root)
         inventory = filter_inventory(
@@ -118,11 +160,13 @@ def main() -> int:
             inventory=inventory,
             variant_lookup=variant_lookup,
             timeout_seconds=args.timeout,
-            tolerance=timedelta(seconds=args.tolerance_seconds),
+            hash_cache=hash_cache,
         )
     except CheckerError as exc:
+        save_hash_cache(hash_cache_path, hash_cache)
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    save_hash_cache(hash_cache_path, hash_cache)
 
     if args.json:
         payload = {
@@ -224,21 +268,32 @@ def run_check(
     inventory: list[dict[str, Any]],
     variant_lookup: dict[str, dict[str, Any]],
     timeout_seconds: int,
-    tolerance: timedelta,
+    hash_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[CheckResult]:
     tree_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    if hash_cache is None:
+        hash_cache = {}
+    if models_root is not None:
+        prune_hash_cache(hash_cache, models_root)
     results: list[CheckResult] = []
 
     for entry in inventory:
         try:
-            resolved = resolve_model_entry(entry, models_root, variant_lookup)
-            remote_entry = get_remote_file_metadata(
-                resolved.remote_repo,
-                resolved.remote_file,
-                timeout_seconds=timeout_seconds,
-                tree_cache=tree_cache,
+            artifacts = resolve_artifacts(entry, models_root, variant_lookup)
+            artifact_results = [
+                compare_artifact(
+                    artifact,
+                    timeout_seconds=timeout_seconds,
+                    tree_cache=tree_cache,
+                    hash_cache=hash_cache,
+                    models_root=models_root,
+                )
+                for artifact in artifacts
+            ]
+            status, message = rollup_model_status(artifact_results)
+            result = build_model_result(
+                entry, artifacts, artifact_results, status, message
             )
-            result = compare_model(resolved, remote_entry, tolerance)
         except CheckerError as exc:
             result = unresolved_result(entry, str(exc))
         results.append(result)
@@ -298,67 +353,120 @@ def load_variant_lookup(inventory: list[dict[str, Any]]) -> dict[str, dict[str, 
     return lookup
 
 
-def resolve_model_entry(
+def resolve_artifacts(
     entry: dict[str, Any],
     models_root: Path,
     variant_lookup: dict[str, dict[str, Any]],
-) -> ResolvedModel:
+) -> list[Artifact]:
+    """Build the set of local artifacts that belong to one model entry.
+
+    The main weight is whatever LM Studio points at. If it is sharded
+    (``-00001-of-00002``), every sibling shard present on disk for the same
+    quant stem is included, because shards are not always moved upstream as a
+    set. For a vision model, any projector present on disk under the
+    conventional ``mmproj``/``projector`` name is included too; a projector that
+    is absent (deleted, renamed, never downloaded) is simply not an installed
+    artifact and is not alerted on -- no special-casing of why it is absent.
+
+    This never guesses: if the main weight LM Studio references is not on disk,
+    it raises ``CheckerError`` so the model is reported unresolved rather than
+    silently re-pointed at some neighboring file.
+    """
     candidates = candidate_references(entry, variant_lookup)
+
+    active: RemoteReference | None = None
     for candidate in candidates:
         local_path = models_root.joinpath(*candidate.local_relative_path.split("/"))
         if local_path.is_file():
-            stat = local_path.stat()
-            return ResolvedModel(
-                model_key=require_string(entry, "modelKey"),
-                display_name=require_string(entry, "displayName"),
-                publisher=require_string(entry, "publisher"),
-                local_path=local_path,
-                local_modified_utc=datetime.fromtimestamp(
-                    stat.st_mtime, tz=timezone.utc
-                ),
-                local_size_bytes=stat.st_size,
-                remote_repo=candidate.repo,
-                remote_file=candidate.remote_file,
-                quantization=((entry.get("quantization") or {}).get("name")),
+            active = candidate
+            break
+
+    if active is None:
+        raise CheckerError(
+            f"Could not resolve a local file for {require_string(entry, 'modelKey')}. "
+            "LM Studio returned metadata, but none of the candidate paths exists on disk."
+        )
+
+    repo = active.repo
+    # Preserve any repository subdirectory in the remote path (e.g. an entry
+    # like org/repo/sub/file.gguf has remote_file = "sub/file.gguf"). Stripping
+    # to the basename would point at the wrong (or missing) remote file.
+    remote_file = active.remote_file
+    main_basename = remote_file.rsplit("/", 1)[-1]
+    remote_prefix = (
+        remote_file[: -len(main_basename)] if remote_file != main_basename else ""
+    )
+    local_dir = models_root.joinpath(*active.local_relative_path.split("/")[:-1])
+    main_local = models_root.joinpath(*active.local_relative_path.split("/"))
+
+    artifacts: list[Artifact] = []
+    seen: set[tuple[str, str]] = set()
+
+    shard_match = SHARD_RE.match(main_basename)
+    if shard_match:
+        stem = shard_match.group("stem")
+        total = int(shard_match.group("total"))
+        # Generate EVERY shard declared by `total`, not just the ones present on
+        # disk. A locally missing shard yields an artifact whose local_path does
+        # not exist, which compare_artifact reports as missing-local (and the
+        # rollup surfaces the model as unresolved). Without this, an incomplete
+        # shard set would be silently reported as up to date.
+        for idx in range(1, total + 1):
+            shard_name = f"{stem}-{idx:05d}-of-{total:05d}.gguf"
+            shard_remote = f"{remote_prefix}{shard_name}"
+            shard_local = local_dir / shard_name
+            key = (repo, shard_remote)
+            if key in seen:
+                continue
+            seen.add(key)
+            artifacts.append(
+                Artifact(
+                    kind="weight",
+                    label=_shard_label(idx, total),
+                    local_path=shard_local,
+                    remote_repo=repo,
+                    remote_file=shard_remote,
+                )
+            )
+    else:
+        key = (repo, remote_file)
+        seen.add(key)
+        artifacts.append(
+            Artifact(
+                kind="weight",
+                label="weights",
+                local_path=main_local,
+                remote_repo=repo,
+                remote_file=remote_file,
+            )
+        )
+
+    # Optional projectors: tracked only when one is present on disk.
+    if entry.get("vision") is True and local_dir.is_dir():
+        for sibling in sorted(local_dir.glob("*.gguf")):
+            if sibling.suffix.lower() != ".gguf":
+                continue
+            if not is_projector_filename(sibling.name):
+                continue
+            key = (repo, sibling.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            artifacts.append(
+                Artifact(
+                    kind="projector",
+                    label=f"projector ({sibling.name})",
+                    local_path=sibling,
+                    remote_repo=repo,
+                    remote_file=sibling.name,
+                )
             )
 
-    # Fallback: if the specific file is missing (e.g. renamed), check the directory
-    for candidate in candidates:
-        candidate_dir = models_root.joinpath(*candidate.local_relative_path.split("/")[:-1])
-        if candidate_dir.is_dir():
-            # Look for any .gguf file in this directory as a proxy
-            # Exclude partial downloads (.part, .tmp, .download)
-            files = [
-                f for f in candidate_dir.glob("*.gguf")
-                if f.suffix == ".gguf"
-            ]
-            if files:
-                # Use the one with the most recent mtime
-                best_file = max(files, key=lambda f: f.stat().st_mtime)
-                print(
-                    f"  note: resolved {require_string(entry, 'modelKey')} via "
-                    f"directory fallback -> {best_file.name}"
-                )
-                stat = best_file.stat()
-                return ResolvedModel(
-                    model_key=require_string(entry, "modelKey"),
-                    display_name=require_string(entry, "displayName"),
-                    publisher=require_string(entry, "publisher"),
-                    local_path=best_file,
-                    local_modified_utc=datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ),
-                    local_size_bytes=stat.st_size,
-                    remote_repo=candidate.repo,
-                    remote_file=candidate.remote_file,
-                    quantization=((entry.get("quantization") or {}).get("name")),
-                )
+    return artifacts
 
-    model_key = require_string(entry, "modelKey")
-    raise CheckerError(
-        f"Could not resolve a local file for {model_key}. "
-        "LM Studio returned metadata, but none of the candidate paths exists on disk."
-    )
+
+def _shard_label(idx: int, total: int) -> str:
+    return f"weights (shard {idx}/{total})"
 
 
 def candidate_references(
@@ -403,6 +511,17 @@ def candidate_references(
     return references
 
 
+def is_projector_filename(name: str) -> bool:
+    """True if a local file is a multimodal projector, not the main weights.
+
+    Projectors share the .gguf extension but must never be substituted for the
+    model itself (they are tiny, model-specific, and their bytes have nothing to
+    do with the weights we are asked to check).
+    """
+    lowered = name.lower()
+    return "mmproj" in lowered or "projector" in lowered
+
+
 def parse_remote_reference(candidate: str) -> RemoteReference | None:
     cleaned = candidate.split("@", 1)[1] if "@" in candidate else candidate
     parts = [segment for segment in cleaned.split("/") if segment]
@@ -426,19 +545,42 @@ def get_remote_file_metadata(
     timeout_seconds: int,
     tree_cache: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, Any]:
-    # Try root and subdirectories if needed
+    """Resolve a file's remote metadata, distinguishing absence from errors.
+
+    Raises ``RemoteFileMissing`` only when the file is confirmed absent (the
+    repo 404s, or the file is missing from trees we successfully listed).
+    Raises ``CheckerError`` when a request failed transiently, so the caller
+    can avoid mistaking a network/auth failure for a removal.
+    """
     search_paths = [""]
     if "/" in remote_file:
         search_paths.append(remote_file.rsplit("/", 1)[0])
 
+    had_error = False
+    repo_confirmed_gone = False
+
+    def fetch_into_cache(key: tuple[str, str], parent: str) -> None:
+        nonlocal had_error, repo_confirmed_gone
+        if key in tree_cache:
+            return
+        try:
+            tree_cache[key] = fetch_tree(repo, parent, timeout_seconds)
+        except RemoteFileMissing:
+            # 404 on a tree endpoint. The repo root being gone means every
+            # file in it is gone; a missing subdir is not conclusive on its own.
+            if parent == "":
+                repo_confirmed_gone = True
+            tree_cache[key] = {}
+        except CheckerError:
+            # Transient failure. Record an empty entry so subsequent lookups in
+            # this run don't KeyError, but keep the flag so the final verdict is
+            # "unresolved" rather than a false "removed".
+            had_error = True
+            tree_cache[key] = {}
+
     for parent in search_paths:
         cache_key = (repo, parent)
-        if cache_key not in tree_cache:
-            try:
-                tree_cache[cache_key] = fetch_tree(repo, parent, timeout_seconds)
-            except CheckerError:
-                continue
-
+        fetch_into_cache(cache_key, parent)
         file_entry = tree_cache[cache_key].get(remote_file)
         if file_entry:
             return file_entry
@@ -447,24 +589,25 @@ def get_remote_file_metadata(
     # This helps when the file is in a folder like 'IQ4_XS' but the path is flat.
     bare_name = remote_file.rsplit("/", 1)[-1] if "/" in remote_file else remote_file
     root_key = (repo, "")
-    if root_key not in tree_cache:
-        tree_cache[root_key] = fetch_tree(repo, "", timeout_seconds)
+    fetch_into_cache(root_key, "")
 
     for entry in tree_cache[root_key].values():
         if entry.get("type") == "directory":
             dir_name = entry["path"]
             dir_key = (repo, dir_name)
-            if dir_key not in tree_cache:
-                try:
-                    tree_cache[dir_key] = fetch_tree(repo, dir_name, timeout_seconds)
-                except CheckerError:
-                    continue
-
+            fetch_into_cache(dir_key, dir_name)
             file_entry = tree_cache[dir_key].get(f"{dir_name}/{bare_name}")
             if file_entry:
                 return file_entry
 
-    raise CheckerError(
+    if repo_confirmed_gone:
+        raise RemoteFileMissing(f"Repository removed on Hugging Face: {repo}")
+    if had_error:
+        raise CheckerError(
+            f"Could not confirm remote status of {repo}/{remote_file} "
+            "(a Hugging Face request failed)."
+        )
+    raise RemoteFileMissing(
         f"Could not find remote file metadata for {repo}/{remote_file}."
     )
 
@@ -510,7 +653,7 @@ def fetch_json(url: str, timeout_seconds: int) -> Any:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise CheckerError(f"Hugging Face resource not found: {url}") from exc
+            raise RemoteFileMissing(f"Hugging Face resource not found: {url}") from exc
         raise CheckerError(f"Hugging Face request failed with HTTP {exc.code}: {url}") from exc
     except urllib.error.URLError as exc:
         raise CheckerError(f"Network error while calling Hugging Face: {exc.reason}") from exc
@@ -518,38 +661,276 @@ def fetch_json(url: str, timeout_seconds: int) -> Any:
         raise CheckerError(f"Invalid JSON received from Hugging Face: {url}") from exc
 
 
-def compare_model(
-    model: ResolvedModel, remote_entry: dict[str, Any], tolerance: timedelta
-) -> CheckResult:
-    remote_modified_value = ((remote_entry.get("lastCommit") or {}).get("date"))
-    if not isinstance(remote_modified_value, str):
-        raise CheckerError(
-            f"Remote file metadata for {model.remote_repo}/{model.remote_file} "
-            "does not include lastCommit.date."
+def compare_artifact(
+    artifact: Artifact,
+    *,
+    timeout_seconds: int,
+    tree_cache: dict[tuple[str, str], dict[str, Any]],
+    hash_cache: dict[str, dict[str, Any]],
+    models_root: Path | None = None,
+) -> ArtifactResult:
+    """Compare one artifact against its Hugging Face counterpart by blob.
+
+    Decision order (cheapest first):
+      1. remote unreachable (transient)  -> unresolved
+      2. remote file confirmed missing   -> removed-remote
+      3. local file missing              -> missing-local
+      4. sizes differ                    -> update-available (no hashing)
+      5. local sha256 != remote lfs.oid  -> update-available
+      6. otherwise                       -> up-to-date
+    """
+    last_commit_title: str | None = None
+    last_commit_date: str | None = None
+    remote_size: int | None = None
+    remote_oid: str | None = None
+
+    def result(status: str, *, local_size: int | None, local_oid: str | None,
+              local_path: str | None, message: str) -> ArtifactResult:
+        return ArtifactResult(
+            kind=artifact.kind,
+            label=artifact.label,
+            status=status,
+            local_path=local_path,
+            remote_file=artifact.remote_file,
+            local_size=local_size,
+            remote_size=remote_size,
+            local_oid=local_oid,
+            remote_oid=remote_oid,
+            last_commit_title=last_commit_title,
+            last_commit_date_utc=last_commit_date,
+            message=message,
         )
 
-    remote_modified_utc = parse_utc(remote_modified_value)
-    delta = (remote_modified_utc - model.local_modified_utc).total_seconds()
+    local_exists = artifact.local_path.is_file()
+    local_size = artifact.local_path.stat().st_size if local_exists else None
+    local_path_str = str(artifact.local_path) if local_exists else None
 
-    if delta > tolerance.total_seconds():
-        status = "update-available"
-        message = "Remote file is newer than the installed LM Studio file."
-    else:
-        status = "up-to-date"
-        message = "Installed LM Studio file is as new as the remote file within tolerance."
+    try:
+        remote = get_remote_file_metadata(
+            artifact.remote_repo,
+            artifact.remote_file,
+            timeout_seconds=timeout_seconds,
+            tree_cache=tree_cache,
+        )
+    except RemoteFileMissing:
+        remote = None
+    except CheckerError as exc:
+        # Transient failure (timeout, auth, network). Must NOT be treated as a
+        # removal -- report unresolved so the user is not misled into acting.
+        return result(
+            "unresolved",
+            local_size=local_size,
+            local_oid=None,
+            local_path=local_path_str,
+            message=f"{artifact.label}: could not reach Hugging Face ({exc}).",
+        )
+
+    if remote:
+        commit = remote.get("lastCommit") or {}
+        last_commit_title = (
+            commit.get("title") if isinstance(commit.get("title"), str) else None
+        )
+        last_commit_date = (
+            commit.get("date") if isinstance(commit.get("date"), str) else None
+        )
+        lfs = remote.get("lfs")
+        remote_size = lfs.get("size") if isinstance(lfs, dict) else None
+        remote_oid = lfs.get("oid") if isinstance(lfs, dict) else None
+
+    if remote is None:
+        if artifact.local_path.is_file():
+            return result(
+                "removed-remote",
+                local_size=artifact.local_path.stat().st_size,
+                local_oid=None,
+                local_path=str(artifact.local_path),
+                message=(
+                    f"{artifact.label}: removed from Hugging Face "
+                    "(a local copy is still on disk)."
+                ),
+            )
+        return result(
+            "removed-remote",
+            local_size=None,
+            local_oid=None,
+            local_path=None,
+            message=(
+                f"{artifact.label}: no longer on Hugging Face and not present locally."
+            ),
+        )
+
+    if not artifact.local_path.is_file():
+        return result(
+            "missing-local",
+            local_size=None,
+            local_oid=None,
+            local_path=None,
+            message=f"{artifact.label}: expected file not found on disk.",
+        )
+
+    stat = artifact.local_path.stat()
+
+    if isinstance(remote_size, int) and stat.st_size != remote_size:
+        return result(
+            "update-available",
+            local_size=stat.st_size,
+            local_oid=None,
+            local_path=str(artifact.local_path),
+            message=(
+                f"{artifact.label}: size differs "
+                f"(local {stat.st_size} vs remote {remote_size})."
+            ),
+        )
+
+    if not (isinstance(remote_oid, str) and remote_oid):
+        return result(
+            "unresolved",
+            local_size=stat.st_size,
+            local_oid=None,
+            local_path=str(artifact.local_path),
+            message=(
+                f"{artifact.label}: remote file has no LFS oid; "
+                "cannot verify content."
+            ),
+        )
+
+    try:
+        local_oid = get_local_oid(artifact.local_path, hash_cache, models_root=models_root)
+    except OSError as exc:
+        return result(
+            "unresolved",
+            local_size=stat.st_size,
+            local_oid=None,
+            local_path=str(artifact.local_path),
+            message=f"{artifact.label}: could not hash local file ({exc}).",
+        )
+
+    if local_oid == remote_oid:
+        return result(
+            "up-to-date",
+            local_size=stat.st_size,
+            local_oid=local_oid,
+            local_path=str(artifact.local_path),
+            message=f"{artifact.label}: bytes match the remote.",
+        )
+
+    return result(
+        "update-available",
+        local_size=stat.st_size,
+        local_oid=local_oid,
+        local_path=str(artifact.local_path),
+        message=f"{artifact.label}: content differs from the remote.",
+    )
+
+
+def rollup_model_status(
+    artifact_results: list[ArtifactResult],
+) -> tuple[str, str]:
+    """Roll per-artifact verdicts into one model-level status + message.
+
+    Severity (highest wins): missing-local weight > removed-remote >
+    update-available > unresolved > up-to-date.
+    """
+    if not artifact_results:
+        return "unresolved", "No artifacts resolved for this model."
+
+    missing_weight = [
+        r.label for r in artifact_results
+        if r.status == "missing-local" and r.kind == "weight"
+    ]
+    if missing_weight:
+        return (
+            "unresolved",
+            "Missing local file(s): " + ", ".join(missing_weight) + ".",
+        )
+
+    removed = [r.label for r in artifact_results if r.status == "removed-remote"]
+    if removed:
+        return (
+            "update-available",
+            "No longer on Hugging Face: " + ", ".join(removed)
+            + " (upstream removed these files).",
+        )
+
+    updates = [r.label for r in artifact_results if r.status == "update-available"]
+    if updates:
+        return (
+            "update-available",
+            "Update available for: " + ", ".join(updates) + ".",
+        )
+
+    unresolved = [r.label for r in artifact_results if r.status == "unresolved"]
+    if unresolved:
+        return (
+            "unresolved",
+            "Could not verify: " + ", ".join(unresolved) + ".",
+        )
+
+    return "up-to-date", "All files match the remote."
+
+
+def build_model_result(
+    entry: dict[str, Any],
+    artifacts: list[Artifact],
+    artifact_results: list[ArtifactResult],
+    status: str,
+    message: str,
+) -> CheckResult:
+    """Assemble a CheckResult, deriving legacy top-level fields from artifacts."""
+    primary = next(
+        (a for a in artifacts if a.kind == "weight"),
+        artifacts[0] if artifacts else None,
+    )
+    primary_result = next(
+        (r for r in artifact_results if primary and r.label == primary.label),
+        None,
+    )
+
+    local_path = str(primary.local_path) if primary and primary.local_path.is_file() else None
+    local_modified_utc: str | None = None
+    if primary and primary.local_path.is_file():
+        local_modified_utc = format_utc(
+            datetime.fromtimestamp(primary.local_path.stat().st_mtime, tz=timezone.utc)
+        )
+
+    remote_repo = primary.remote_repo if primary else None
+    remote_file = primary.remote_file if primary else None
+
+    commit_dates = [
+        parse_utc(r.last_commit_date_utc)
+        for r in artifact_results
+        if r.last_commit_date_utc
+    ]
+    remote_modified_utc = format_utc(max(commit_dates)) if commit_dates else None
+
+    delta_seconds: float | None = None
+    if remote_modified_utc and local_modified_utc:
+        delta_seconds = (
+            parse_utc(remote_modified_utc) - parse_utc(local_modified_utc)
+        ).total_seconds()
+
+    headline = next(
+        (r for r in artifact_results if r.status in {"update-available", "removed-remote"}),
+        primary_result,
+    )
 
     return CheckResult(
-        model_key=model.model_key,
-        display_name=model.display_name,
+        model_key=require_string(entry, "modelKey"),
+        display_name=require_string(entry, "displayName"),
         status=status,
-        publisher=model.publisher,
-        local_path=str(model.local_path),
-        local_modified_utc=format_utc(model.local_modified_utc),
-        remote_repo=model.remote_repo,
-        remote_file=model.remote_file,
-        remote_modified_utc=format_utc(remote_modified_utc),
-        delta_seconds=delta,
+        publisher=require_string(entry, "publisher"),
+        local_path=local_path,
+        local_modified_utc=local_modified_utc,
+        remote_repo=remote_repo,
+        remote_file=remote_file,
+        remote_modified_utc=remote_modified_utc,
+        delta_seconds=delta_seconds,
         message=message,
+        remote_sha256=(headline.remote_oid if headline else None),
+        local_sha256=(headline.local_oid if headline else None),
+        hash_method="lfs-oid",
+        last_commit_title=(headline.last_commit_title if headline else None),
+        artifacts=artifact_results,
     )
 
 
@@ -559,6 +940,101 @@ def parse_utc(value: str) -> datetime:
 
 def format_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def compute_sha256(path: Path) -> str:
+    """Stream-hash a (potentially large) file and return its hex sha256."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_local_oid(
+    path: Path,
+    hash_cache: dict[str, dict[str, Any]],
+    *,
+    models_root: Path | None = None,
+) -> str:
+    """Return the local file's sha256, cached by (size, mtime_ns).
+
+    Hugging Face LFS oids are the sha256 of the raw file content, so a local
+    sha256 can be compared directly to the remote ``lfs.oid``. The cache key is
+    the path relative to ``models_root`` when provided (survives moving the
+    models directory), otherwise the resolved absolute path.
+    """
+    stat = path.stat()
+    key = _hash_cache_key(path, models_root)
+    entry = hash_cache.get(key)
+    if (
+        isinstance(entry, dict)
+        and entry.get("size") == stat.st_size
+        and entry.get("mtime_ns") == stat.st_mtime_ns
+        and isinstance(entry.get("sha256"), str)
+    ):
+        return entry["sha256"]
+
+    sha256 = compute_sha256(path)
+    hash_cache[key] = {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": sha256,
+    }
+    return sha256
+
+
+def _hash_cache_key(path: Path, models_root: Path | None) -> str:
+    try:
+        if models_root is not None:
+            rel = path.resolve().relative_to(models_root.resolve())
+            return rel.as_posix()
+    except ValueError:
+        pass
+    return str(path.resolve())
+
+
+def prune_hash_cache(
+    cache: dict[str, dict[str, Any]], models_root: Path
+) -> None:
+    """Drop cache entries whose file no longer exists under models_root.
+
+    Mutates ``cache`` in place so callers that retain their original reference
+    (and later save it) persist the surviving entries along with any new hashes
+    computed during the check. Entries keyed by paths outside models_root are
+    left untouched.
+    """
+    for key in list(cache.keys()):
+        if (models_root / key).is_file():
+            continue
+        del cache[key]
+
+
+def default_hash_cache_path() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return Path.cwd() / "lmstudio-weight-local-hash-cache.json"
+    return Path(appdata) / "LM Studio Weight Watcher" / "local_hash_cache.json"
+
+
+def load_hash_cache(path: Path | None) -> dict[str, dict[str, Any]]:
+    if not path or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_hash_cache(path: Path | None, cache: dict[str, dict[str, Any]]) -> None:
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def unresolved_result(entry: dict[str, Any], message: str) -> CheckResult:
@@ -629,18 +1105,25 @@ def print_human_report(
     for result in visible:
         print()
         print(f"[{result.status}] {result.display_name} ({result.model_key})")
+        if result.remote_repo:
+            print(f"  repository:      {result.remote_repo}")
         if result.local_path:
-            print(f"  local path: {result.local_path}")
-        if result.local_modified_utc:
-            print(f"  local modified:  {result.local_modified_utc}")
-        if result.remote_repo and result.remote_file:
-            print(f"  remote file:     {result.remote_repo}/{result.remote_file}")
+            print(f"  local path:      {result.local_path}")
         if result.remote_modified_utc:
             print(f"  remote modified: {result.remote_modified_utc}")
         if result.delta_seconds is not None:
             print(f"  delta:           {humanize_delta(result.delta_seconds)}")
+        if result.last_commit_title:
+            print(f"  last commit:     {result.last_commit_title}")
         if result.message:
             print(f"  note:            {result.message}")
+        for art in result.artifacts:
+            print(
+                f"    - [{art.status}] {art.label}  "
+                f"({art.remote_file})"
+            )
+            if art.last_commit_title:
+                print(f"        commit: {art.last_commit_title}")
 
 
 def humanize_delta(delta_seconds: float) -> str:

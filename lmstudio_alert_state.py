@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -175,6 +176,10 @@ def alert_payload(
         "remote_modified_utc": result.remote_modified_utc,
         "delta_seconds": result.delta_seconds,
         "message": result.message,
+        "remote_sha256": getattr(result, "remote_sha256", None),
+        "hash_method": getattr(result, "hash_method", None),
+        "last_commit_title": getattr(result, "last_commit_title", None),
+        "artifacts": [asdict(a) for a in getattr(result, "artifacts", [])],
         "fingerprint": fingerprint_for_result(result),
         "first_detected_utc": first_detected_utc or format_utc(now_utc),
         "last_detected_utc": format_utc(now_utc),
@@ -184,11 +189,30 @@ def alert_payload(
 
 
 def fingerprint_for_result(result: CheckResult) -> str:
+    """Identity of a model that is stable across cosmetic remote churn.
+
+    Built from the per-artifact blob identities (file path + remote LFS oid, or
+    the artifact status when there is no oid, e.g. removed-remote). This means a
+    Hugging Face rename / upload-folder commit that leaves the bytes untouched
+    cannot resurrect an acknowledged alert, while ANY genuine content change in
+    ANY artifact (weight shard or projector) flips the fingerprint and re-raises
+    the alert. Falls back to the legacy single-file identity for results that
+    carry no artifact breakdown.
+    """
+    artifacts = getattr(result, "artifacts", [])
+    if artifacts:
+        parts: list[str] = [result.remote_repo or ""]
+        for art in artifacts:
+            oid = art.remote_oid or art.status or ""
+            parts.append(f"{art.remote_file}={oid}")
+        return "|".join(parts)
+
+    identity = getattr(result, "remote_sha256", None) or result.remote_modified_utc
     return "|".join(
         [
             result.remote_repo or "",
             result.remote_file or "",
-            result.remote_modified_utc or "",
+            identity or "",
         ]
     )
 

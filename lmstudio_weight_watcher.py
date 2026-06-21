@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import threading
+import webbrowser
 from dataclasses import dataclass  
 from datetime import datetime, timedelta, timezone  
 from pathlib import Path  
@@ -32,8 +33,10 @@ from lmstudio_weight_checker import (
     discover_models_root,  
     filter_inventory,  
     format_utc,  
+    load_hash_cache,  
     load_lms_json,  
     load_variant_lookup,  
+    save_hash_cache,  
     run_check,  
 )  
   
@@ -41,7 +44,6 @@ DEFAULT_CHECK_INTERVAL_HOURS = 6
 DEFAULT_REMINDER_INTERVAL_MINUTES = 60  
 DEFAULT_SNOOZE_HOURS = 4  
 DEFAULT_TIMEOUT_SECONDS = 30
-DEFAULT_TOLERANCE_SECONDS = 60
 APP_NAME = "LM Studio Weight Watcher"
   
 # Color palette (light, neutral, desktop-friendly)  
@@ -55,6 +57,8 @@ COLOR_DANGER = "#cf222e"
 COLOR_WARN = "#bf8700"  
 COLOR_OK = "#1a7f37"  
 COLOR_SNOOZE = "#8250df"  
+COLOR_DETAIL_BG = "#eef6ff"
+COLOR_DETAIL_BORDER = "#c8dff8"
   
 ROW_PENDING_BG = "#fff5f5"  
 ROW_SNOOZED_BG = "#f7f4ff"  
@@ -106,12 +110,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TIMEOUT_SECONDS,
         help=f"HTTP timeout for Hugging Face requests. Default: {DEFAULT_TIMEOUT_SECONDS}.",
     )
-    parser.add_argument(
-        "--tolerance-seconds",
-        type=int,
-        default=DEFAULT_TOLERANCE_SECONDS,
-        help=f"How much newer a remote file must be before it counts as an update. Default: {DEFAULT_TOLERANCE_SECONDS}.",
-    )
     return parser.parse_args()  
   
   
@@ -134,7 +132,7 @@ def main() -> int:
             state_path=state_path,
             models_root_override=args.models_root,
             timeout_seconds=args.timeout_seconds,
-            tolerance_seconds=args.tolerance_seconds,
+            hash_cache_path=state_path.parent / "local_hash_cache.json",
         )
 
     app = WatcherApp(
@@ -144,7 +142,6 @@ def main() -> int:
         reminder_interval=timedelta(minutes=args.reminder_interval_minutes),
         snooze_hours=args.snooze_hours,
         timeout_seconds=args.timeout_seconds,
-        tolerance_seconds=args.tolerance_seconds,
     )
     try:
         app.start()
@@ -161,13 +158,13 @@ def run_once(
     state_path: Path,
     models_root_override: Path | None,
     timeout_seconds: int,
-    tolerance_seconds: int,
+    hash_cache_path: Path,
 ) -> int:
     state = load_state(state_path)  
     outcome = perform_check(
         models_root_override,
         timeout_seconds=timeout_seconds,
-        tolerance_seconds=tolerance_seconds,
+        hash_cache_path=hash_cache_path,
     )
     next_state = apply_results(  
         state,  
@@ -195,36 +192,39 @@ def perform_check(
     models_root_override: Path | None,
     *,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-    tolerance_seconds: int = DEFAULT_TOLERANCE_SECONDS,
+    hash_cache_path: Path | None = None,
 ) -> CheckOutcome:
-    generated_at_utc = datetime.now(timezone.utc)  
+    generated_at_utc = datetime.now(timezone.utc)
     models_root = None
-    error = None  
-  
-    try:  
-        models_root = discover_models_root(models_root_override)  
-        inventory = filter_inventory(  
-            load_lms_json(["ls", "--json"]),  
-            include_embeddings=False,  
-        )  
-        variant_lookup = load_variant_lookup(inventory)  
-        results = run_check(  
-            models_root=models_root,  
-            inventory=inventory,  
-            variant_lookup=variant_lookup,  
-            timeout_seconds=timeout_seconds,  
-            tolerance=timedelta(seconds=tolerance_seconds),  
-        )  
-    except CheckerError as exc:  
-        error = str(exc)  
-        results = []  
-  
-    return CheckOutcome(  
-        models_root=models_root,  
-        results=results,  
-        error=error,  
-        generated_at_utc=generated_at_utc,  
-    )  
+    error = None
+    hash_cache = load_hash_cache(hash_cache_path)
+
+    try:
+        models_root = discover_models_root(models_root_override)
+        inventory = filter_inventory(
+            load_lms_json(["ls", "--json"]),
+            include_embeddings=False,
+        )
+        variant_lookup = load_variant_lookup(inventory)
+        results = run_check(
+            models_root=models_root,
+            inventory=inventory,
+            variant_lookup=variant_lookup,
+            timeout_seconds=timeout_seconds,
+            hash_cache=hash_cache,
+        )
+    except CheckerError as exc:
+        error = str(exc)
+        results = []
+    finally:
+        save_hash_cache(hash_cache_path, hash_cache)
+
+    return CheckOutcome(
+        models_root=models_root,
+        results=results,
+        error=error,
+        generated_at_utc=generated_at_utc,
+    )
   
   
 class WatcherApp:  
@@ -237,15 +237,14 @@ class WatcherApp:
         reminder_interval: timedelta,  
         snooze_hours: int,  
         timeout_seconds: int,
-        tolerance_seconds: int,
     ) -> None:  
         self.state_path = state_path  
+        self.hash_cache_path = self.state_path.parent / "local_hash_cache.json"  
         self.models_root_override = models_root_override  
         self.check_interval = check_interval  
         self.reminder_interval = reminder_interval  
         self.snooze_hours = snooze_hours  
         self.timeout_seconds = timeout_seconds
-        self.tolerance_seconds = tolerance_seconds
         self.state = load_state(state_path)  
         self.last_models_root = None  
         self.check_in_progress = False  
@@ -266,7 +265,8 @@ class WatcherApp:
         self.unresolved_count_var = tk.StringVar(master=self.root, value="0")  
         self.checked_count_var = tk.StringVar(master=self.root, value="0")  
         self.status_var = tk.StringVar(master=self.root, value="Starting...")  
-        self.selection_var = tk.StringVar(master=self.root, value="No selection")  
+        self.selection_var = tk.StringVar(master=self.root, value="No selection")
+        self._alerts_by_key: dict[str, dict] = {}  
   
         self.icon = pystray.Icon(  
             "lmstudio_weight_watcher",  
@@ -343,7 +343,7 @@ class WatcherApp:
         outcome = perform_check(
             self.models_root_override,
             timeout_seconds=self.timeout_seconds,
-            tolerance_seconds=self.tolerance_seconds,
+            hash_cache_path=self.hash_cache_path,
         )
         if self.shutting_down:  
             return  
@@ -477,6 +477,12 @@ class WatcherApp:
                         foreground=COLOR_MUTED, font=self._fonts["subline"])  
         style.configure("Selection.TLabel", background=COLOR_BG,  
                         foreground=COLOR_MUTED, font=self._fonts["subline"])  
+        style.configure(
+            "Hint.TLabel",
+            background=COLOR_BG,
+            foreground=COLOR_MUTED,
+            font=self._fonts["subline"],
+        )
   
         # Treeview  
         style.configure(  
@@ -484,7 +490,7 @@ class WatcherApp:
             background=COLOR_CARD,  
             fieldbackground=COLOR_CARD,  
             foreground=COLOR_TEXT,  
-            rowheight=28,  
+            rowheight=32,  
             borderwidth=0,  
         )  
         style.configure(  
@@ -508,8 +514,8 @@ class WatcherApp:
     def create_window(self) -> None:  
         self.window = tk.Toplevel(self.root)  
         self.window.title(APP_NAME)  
-        self.window.geometry("1020x620")  
-        self.window.minsize(860, 500)  
+        self.window.geometry("1180x680")  
+        self.window.minsize(960, 540)  
         self.window.configure(bg=COLOR_BG)  
         self.window.protocol("WM_DELETE_WINDOW", self.hide_window)  
   
@@ -545,18 +551,23 @@ class WatcherApp:
         self._make_metric(metrics, "Tracked", self.checked_count_var,  
                           "MetricValue.TLabel", col=3)  
   
-        # --- Alerts section ---  
-        ttk.Label(outer, text="MODEL ALERTS",  
-                  style="Section.TLabel").pack(anchor="w", pady=(14, 6))  
-  
+        # --- Alerts section ---
         alerts_card = ttk.Frame(outer, style="Card.TFrame", padding=1)  
-        alerts_card.pack(fill=tk.BOTH, expand=True)  
+        alerts_card.pack(fill=tk.BOTH, expand=True, pady=(14, 0))  
         self._add_card_border(alerts_card)  
   
         tree_wrap = ttk.Frame(alerts_card, style="Card.TFrame")  
         tree_wrap.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)  
   
-        columns = ("model", "status", "remote_modified", "delta")  
+        columns = (
+            "model",
+            "uploader",
+            "repository",
+            "remote_file",
+            "status",
+            "remote_modified",
+            "delta",
+        )
         self.tree = ttk.Treeview(  
             tree_wrap,  
             columns=columns,  
@@ -565,18 +576,28 @@ class WatcherApp:
             selectmode="extended",  
         )  
         self.tree.heading("model", text="  Model")  
+        self.tree.heading("uploader", text="Uploader")  
+        self.tree.heading("repository", text="HF Repository")  
+        self.tree.heading("remote_file", text="File")  
         self.tree.heading("status", text="Status")  
-        self.tree.heading("remote_modified", text="Remote Modified")  
+        self.tree.heading("remote_modified", text="Remote Updated")  
         self.tree.heading("delta", text="Time Delta")  
-        self.tree.column("model", width=460, anchor="w")  
-        self.tree.column("status", width=180, anchor="w")  
-        self.tree.column("remote_modified", width=200, anchor="w")  
-        self.tree.column("delta", width=160, anchor="w")  
+        self.tree.column("model", width=220, anchor="w", stretch=True)  
+        self.tree.column("uploader", width=130, anchor="w", stretch=False)  
+        self.tree.column("repository", width=240, anchor="w", stretch=True)  
+        self.tree.column("remote_file", width=200, anchor="w", stretch=True)  
+        self.tree.column("status", width=150, anchor="w", stretch=False)  
+        self.tree.column("remote_modified", width=130, anchor="w", stretch=False)  
+        self.tree.column("delta", width=120, anchor="w", stretch=False)  
   
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)  
-        self.tree.configure(yscrollcommand=vsb.set)  
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)  
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)  
+        hsb = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)  
   
         # Row tags for color coding  
         self.tree.tag_configure("pending", background=ROW_PENDING_BG, foreground=COLOR_TEXT)  
@@ -586,6 +607,46 @@ class WatcherApp:
   
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)  
         self.tree.bind("<Double-1>", lambda e: self.acknowledge_selected())  
+
+        detail_card = tk.Frame(
+            alerts_card,
+            bg=COLOR_DETAIL_BG,
+            highlightbackground=COLOR_DETAIL_BORDER,
+            highlightthickness=1,
+        )
+        detail_card.pack(fill=tk.X, padx=10, pady=(0, 10))
+        detail_inner = tk.Frame(detail_card, bg=COLOR_DETAIL_BG, padx=12, pady=10)
+        detail_inner.pack(fill=tk.X)
+        tk.Label(
+            detail_inner,
+            text="Selected",
+            bg=COLOR_DETAIL_BG,
+            fg=COLOR_MUTED,
+            font=(self._fonts["subline"].actual("family"), 9, "bold"),
+        ).pack(anchor="w")
+        self.detail_text = tk.Text(
+            detail_inner,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            height=10,
+            bg=COLOR_DETAIL_BG,
+            fg=COLOR_TEXT,
+            font=self._fonts["mono"],
+            padx=0,
+            pady=0,
+            highlightthickness=0,
+            cursor="xterm",
+        )
+        self.detail_text.pack(anchor="w", fill=tk.X, pady=(4, 0))
+        self.detail_text.tag_configure("muted", foreground=COLOR_MUTED)
+        self.detail_text.tag_configure(
+            "link", foreground=COLOR_ACCENT, underline=True
+        )
+        self.detail_text.bind("<Button-1>", self._on_detail_click)
+        self.detail_text.bind("<Motion>", self._on_detail_motion)
+        self.detail_text.bind("<Leave>", self._on_detail_leave)
+        self.detail_text.configure(state=tk.DISABLED)
   
         # --- Toolbar ---  
         toolbar = ttk.Frame(outer, style="Toolbar.TFrame")  
@@ -609,6 +670,9 @@ class WatcherApp:
   
         ttk.Separator(toolbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)  
   
+        ttk.Button(mid, text="Open on Hugging Face",
+                   command=self.open_selected_on_hf).pack(side=tk.LEFT, padx=(6, 0))
+
         # Right-of-middle: bulk  
         bulk = ttk.Frame(toolbar, style="Toolbar.TFrame")  
         bulk.pack(side=tk.LEFT)  
@@ -634,7 +698,7 @@ class WatcherApp:
   
         self.unresolved_text = tk.Text(  
             unresolved_card,  
-            height=7,  
+            height=5,  
             wrap="word",  
             relief="flat",  
             borderwidth=0,  
@@ -678,14 +742,108 @@ class WatcherApp:
         ttk.Label(cell, text=label, style="MetricLabel.TLabel").pack(anchor="e")  
   
     def _on_tree_select(self, _event=None) -> None:  
-        count = len(self.selected_model_keys())  
+        selected = self.selected_model_keys()  
+        count = len(selected)  
         if count == 0:  
             self.selection_var.set("No selection")  
+            self._render_detail(None, selection_text="Select a row to see the source and the upstream commit.")
         elif count == 1:  
             self.selection_var.set("1 model selected")  
+            alert = self._alerts_by_key.get(selected[0])
+            self._render_detail(alert)
         else:  
-            self.selection_var.set(f"{count} models selected")  
+            self.selection_var.set(f"{count} models selected")
+            uploaders = sorted(
+                {
+                    uploader
+                    for key in selected
+                    if key in self._alerts_by_key
+                    for uploader in [
+                        split_remote_repo(self._alerts_by_key[key].get("remote_repo"))[0]
+                    ]
+                    if uploader != "—"
+                }
+            )
+            if uploaders:
+                self._render_detail(None, selection_text=f"{count} models selected · uploaders: {', '.join(uploaders)}")
+            else:
+                self._render_detail(None, selection_text=f"{count} models selected")
   
+    def _render_detail(self, alert: dict | None, *, selection_text: str | None = None) -> None:
+        if not hasattr(self, "detail_text"):
+            return
+        text = self.detail_text
+        text.configure(state=tk.NORMAL)
+        text.delete("1.0", tk.END)
+        if alert is None:
+            text.insert("1.0", selection_text or "Select a row to see details.")
+            text.configure(state=tk.DISABLED)
+            return
+
+        text.insert(tk.END, format_alert_detail(alert) + "\n")
+
+        commit_title = alert.get("last_commit_title")
+        remote_mod = alert.get("remote_modified_utc")
+        if commit_title or remote_mod:
+            text.insert(tk.END, "\n", "muted")
+            text.insert(tk.END, "Last upstream commit: ", "muted")
+            if commit_title:
+                text.insert(tk.END, commit_title)
+            if remote_mod:
+                text.insert(tk.END, f"  ({format_iso_friendly(remote_mod)})", "muted")
+            text.insert(tk.END, "\n")
+
+        artifacts = alert.get("artifacts") or []
+        if artifacts:
+            text.insert(tk.END, "\n", "muted")
+            text.insert(tk.END, f"Files checked ({len(artifacts)}):\n", "muted")
+            for a in artifacts:
+                status = a.get("status", "?")
+                label = a.get("label") or a.get("remote_file") or "?"
+                line = f"  - [{status}] {label}"
+                ct = a.get("last_commit_title")
+                if ct:
+                    line += f"  (commit: {ct})"
+                text.insert(tk.END, line + "\n")
+
+        repo = alert.get("remote_repo")
+        if repo:
+            url = hf_repo_url(repo)
+            text.insert(tk.END, "\n", "muted")
+            text.insert(tk.END, "Open on Hugging Face: ", "muted")
+            text.insert(tk.END, url + "\n", "link")
+
+        text.configure(state=tk.DISABLED)
+
+    def _on_detail_click(self, event) -> None:
+        index = self.detail_text.index(f"@{event.x},{event.y}")
+        if "link" not in self.detail_text.tag_names(index):
+            return
+        ranges = self.detail_text.tag_ranges("link")
+        for i in range(0, len(ranges), 2):
+            start, end = ranges[i], ranges[i + 1]
+            if (self.detail_text.compare(start, "<=", index)
+                    and self.detail_text.compare(index, "<", end)):
+                open_url(self.detail_text.get(start, end).strip())
+                return
+
+    def _on_detail_motion(self, event) -> None:
+        index = self.detail_text.index(f"@{event.x},{event.y}")
+        over_link = "link" in self.detail_text.tag_names(index)
+        self.detail_text.configure(cursor="hand2" if over_link else "xterm")
+
+    def _on_detail_leave(self, _event=None) -> None:
+        self.detail_text.configure(cursor="xterm")
+
+    def open_selected_on_hf(self) -> None:
+        selected = self.selected_model_keys()
+        if not selected:
+            return
+        alert = self._alerts_by_key.get(selected[0])
+        if not alert or not alert.get("remote_repo"):
+            return
+        open_url(hf_repo_url(alert["remote_repo"]))
+
     # ----- Refresh -----  
   
     def refresh_tree(self) -> None:  
@@ -705,11 +863,20 @@ class WatcherApp:
             return (order, (a.get("display_name") or a.get("model_key", "")).lower())  
   
         alerts.sort(key=sort_key)  
+        self._alerts_by_key = {alert["model_key"]: alert for alert in alerts}
   
         if not alerts:  
             self.tree.insert(  
                 "", tk.END,  
-                values=("  No model alerts — everything looks up to date.", "", "", ""),  
+                values=(
+                    "  No model alerts — everything looks up to date.",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ),
                 tags=("empty",),  
             )  
         else:  
@@ -723,15 +890,20 @@ class WatcherApp:
                 tag = status_raw if status_raw in ("pending", "snoozed", "acknowledged") else "pending"  
   
                 name = alert.get("display_name") or alert["model_key"]  
+                uploader, repo_tail = split_remote_repo(alert.get("remote_repo"))  
+                remote_file = remote_file_basename(alert.get("remote_file"))  
                 # Prefix bullet only for pending  
-                prefix = "  ● " if tag == "pending" else "    "  
+                prefix = "● " if tag == "pending" else ""  
   
                 self.tree.insert(  
                     "",  
                     tk.END,  
                     iid=alert["model_key"],  
                     values=(  
-                        f"{prefix}{name}",  
+                        f"  {prefix}{name}",  
+                        uploader,  
+                        repo_tail,  
+                        remote_file,  
                         status_display,  
                         remote_display,  
                         delta_text,  
@@ -780,10 +952,18 @@ class WatcherApp:
                 name = item.get("display_name") or item.get("model_key") or "(unknown)"  
                 key = item.get("model_key", "")  
                 msg = item.get("message", "")  
+                remote_repo = item.get("remote_repo")
                 self.unresolved_text.insert(tk.END, "  • ", "muted")  
                 self.unresolved_text.insert(tk.END, f"{name}", "name")  
                 if key and key != name:  
-                    self.unresolved_text.insert(tk.END, f"  ({key})", "muted")  
+                    self.unresolved_text.insert(tk.END, f"  ({key})", "muted")
+                if remote_repo:
+                    uploader, _ = split_remote_repo(remote_repo)
+                    self.unresolved_text.insert(
+                        tk.END,
+                        f"\n      source: {uploader} / {remote_repo}",
+                        "muted",
+                    )
                 self.unresolved_text.insert(tk.END, f"\n      {msg}\n")  
   
         if not last_error and not unresolved:  
@@ -943,8 +1123,84 @@ class WatcherApp:
             pass  
   
   
-# ----- Helpers -----  
-  
+# ----- Helpers -----
+
+
+def split_remote_repo(remote_repo: str | None) -> tuple[str, str]:
+    """Split org/repo into (uploader, repository tail)."""
+    if not remote_repo:
+        return ("—", "—")
+    parts = remote_repo.split("/", 1)
+    if len(parts) == 1:
+        return (parts[0], "—")
+    return (parts[0], parts[1])
+
+
+def remote_file_basename(remote_file: str | None) -> str:
+    if not remote_file:
+        return "—"
+    name = Path(remote_file).name
+    return name or remote_file
+
+
+def hf_repo_url(repo: str | None) -> str:
+    """Stable repo URL for a Hugging Face org/repo, e.g. unsloth/Foo-GGUF."""
+    if not repo:
+        return ""
+    return f"https://huggingface.co/{repo.strip().strip('/')}"
+
+
+def hf_file_url(repo: str | None, remote_file: str | None) -> str:
+    """Best-effort direct file URL. May 404 for files nested in subdirs."""
+    base = hf_repo_url(repo)
+    if not base or not remote_file:
+        return base
+    return f"{base}/blob/main/{remote_file.lstrip('/')}"
+
+
+def open_url(url: str) -> None:
+    if not url:
+        return
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def format_alert_detail(alert: dict | None) -> str:
+    if not alert:
+        return "Selection details unavailable."
+
+    lines: list[str] = []
+    uploader, repo_tail = split_remote_repo(alert.get("remote_repo"))
+    remote_repo = alert.get("remote_repo")
+    remote_file = alert.get("remote_file")
+
+    if uploader != "—":
+        lines.append(f"Uploader: {uploader}")
+    if remote_repo:
+        lines.append(f"Repository: {remote_repo}")
+    elif repo_tail != "—":
+        lines.append(f"Repository: {repo_tail}")
+    if remote_file:
+        lines.append(f"Remote file: {remote_file}")
+    if alert.get("local_path"):
+        lines.append(f"Local file: {alert['local_path']}")
+    publisher = alert.get("publisher")
+    if publisher:
+        lines.append(f"LM Studio publisher: {publisher}")
+    remote_blob = alert.get("remote_sha256")
+    if remote_blob:
+        method = alert.get("hash_method") or "lfs-oid"
+        lines.append(f"Remote blob: {remote_blob[:12]}…  (verified by {method})")
+
+    display = alert.get("display_name") or alert.get("model_key")
+    if display:
+        lines.insert(0, f"Model: {display}")
+
+    return "\n".join(lines) if lines else "No source metadata for this alert."
+
+
 def humanize_delta(delta_seconds: float) -> str:  
     if delta_seconds is None:  
         return "—"  

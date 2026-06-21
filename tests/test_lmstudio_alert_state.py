@@ -21,6 +21,7 @@ def make_result(
     model_key: str = "test-model",
     remote_modified_utc: str = "2026-04-18T01:00:00Z",
     status: str = "update-available",
+    remote_sha256: str | None = None,
 ) -> CheckResult:
     return CheckResult(
         model_key=model_key,
@@ -34,6 +35,7 @@ def make_result(
         remote_modified_utc=remote_modified_utc,
         delta_seconds=3600,
         message="Remote file is newer than the installed LM Studio file.",
+        remote_sha256=remote_sha256,
     )
 
 
@@ -59,6 +61,29 @@ class ApplyResultsTests(unittest.TestCase):
         )
 
         self.assertEqual(refreshed["alerts"]["test-model"]["status"], "pending")
+
+    def test_stable_blob_is_not_reactivated_by_date_only_churn(self) -> None:
+        # When a remote blob identity is known, a mere commit-date bump (e.g. a
+        # Hugging Face rename / upload-folder commit that doesn't change bytes)
+        # must not resurrect an acknowledged alert.
+        now = datetime(2026, 4, 19, tzinfo=timezone.utc)
+        state = apply_results(
+            {}, [make_result(remote_sha256="abc123")], now_utc=now
+        )
+        state = acknowledge_alerts(state, ["test-model"])
+
+        refreshed = apply_results(
+            state,
+            [
+                make_result(
+                    remote_modified_utc="2026-04-19T05:00:00Z",
+                    remote_sha256="abc123",
+                )
+            ],
+            now_utc=now + timedelta(hours=1),
+        )
+
+        self.assertEqual(refreshed["alerts"]["test-model"]["status"], "acknowledged")
 
     def test_up_to_date_result_clears_existing_alert(self) -> None:
         now = datetime(2026, 4, 19, tzinfo=timezone.utc)

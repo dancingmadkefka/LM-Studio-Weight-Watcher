@@ -4,15 +4,77 @@ import tkinter as tk
 import unittest
 from unittest.mock import Mock, patch
 
-from lmstudio_weight_watcher import CheckOutcome, WatcherApp
+from lmstudio_weight_watcher import (
+    CheckOutcome,
+    WatcherApp,
+    format_alert_detail,
+    hf_file_url,
+    hf_repo_url,
+    remote_file_basename,
+    split_remote_repo,
+)
+
+
+class HfUrlTests(unittest.TestCase):
+    def test_repo_url_strips_slashes(self) -> None:
+        self.assertEqual(
+            hf_repo_url("unsloth/Foo-GGUF/"),
+            "https://huggingface.co/unsloth/Foo-GGUF",
+        )
+
+    def test_repo_url_empty(self) -> None:
+        self.assertEqual(hf_repo_url(None), "")
+
+    def test_file_url_builds_blob_path(self) -> None:
+        self.assertEqual(
+            hf_file_url("unsloth/Foo", "a/b.gguf"),
+            "https://huggingface.co/unsloth/Foo/blob/main/a/b.gguf",
+        )
+
+    def test_file_url_without_file_falls_back_to_repo(self) -> None:
+        self.assertEqual(
+            hf_file_url("unsloth/Foo", None),
+            "https://huggingface.co/unsloth/Foo",
+        )
+
+
+class RemoteSourceFormattingTests(unittest.TestCase):
+    def test_split_remote_repo(self) -> None:
+        self.assertEqual(
+            split_remote_repo("bartowski/Some-Model-GGUF"),
+            ("bartowski", "Some-Model-GGUF"),
+        )
+        self.assertEqual(split_remote_repo(None), ("—", "—"))
+
+    def test_remote_file_basename(self) -> None:
+        self.assertEqual(
+            remote_file_basename("folder/model-Q4_K_M.gguf"),
+            "model-Q4_K_M.gguf",
+        )
+
+    def test_format_alert_detail_includes_uploader_and_paths(self) -> None:
+        detail = format_alert_detail(
+            {
+                "display_name": "Test Model",
+                "remote_repo": "bartowski/Test-GGUF",
+                "remote_file": "Test-GGUF/model-Q4_K_M.gguf",
+                "local_path": "C:/models/test.gguf",
+                "publisher": "test-publisher",
+            }
+        )
+        self.assertIn("Model: Test Model", detail)
+        self.assertIn("Uploader: bartowski", detail)
+        self.assertIn("Repository: bartowski/Test-GGUF", detail)
+        self.assertIn("Remote file: Test-GGUF/model-Q4_K_M.gguf", detail)
+        self.assertIn("Local file: C:/models/test.gguf", detail)
 
 
 class WatcherLifecycleTests(unittest.TestCase):
     def make_app(self) -> WatcherApp:
         app = object.__new__(WatcherApp)
         app.models_root_override = None
+        app.hash_cache_path = None
         app.timeout_seconds = 30
-        app.tolerance_seconds = 60
         app.shutting_down = False
         app.next_check_token = None
         app.topmost_reset_token = None
@@ -37,7 +99,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         perform_check.assert_called_once_with(
             None,
             timeout_seconds=30,
-            tolerance_seconds=60,
+            hash_cache_path=None,
         )
         app.root.after.assert_not_called()
 
@@ -57,7 +119,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         perform_check.assert_called_once_with(
             None,
             timeout_seconds=30,
-            tolerance_seconds=60,
+            hash_cache_path=None,
         )
         app.root.after.assert_called_once()
 

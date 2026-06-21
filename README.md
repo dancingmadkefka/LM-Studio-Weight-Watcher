@@ -70,16 +70,17 @@ Change the check interval or reminder timing:
 python .\lmstudio_weight_watcher.py --check-interval-hours 4 --reminder-interval-minutes 30
 ```
 
-Change the watcher timeout or update tolerance:
+Change the watcher timeout:
 
 ```powershell
-python .\lmstudio_weight_watcher.py --timeout-seconds 45 --tolerance-seconds 90
+python .\lmstudio_weight_watcher.py --timeout-seconds 45
 ```
 
 ## Notes
 
 - By default, the script discovers the models folder from `%APPDATA%\LM Studio\settings.json`.
-- It uses a 60 second tolerance window to avoid false positives from timestamp rounding or metadata lag.
+- It uses blob-hash comparisons with a relative-path hash cache to avoid re-hashing
+  large `.gguf` files on every check.
 - Persistent watcher state is stored by default in `%APPDATA%\LM Studio Weight Watcher\state.json`.
 - Existing installs using the old `LM Studio Weight Updater` state path are still recognized automatically.
 - The launcher first checks `%LMSTUDIO_WATCHER_PYTHON%`, then a local `.venv`, then `python`, then `py -3`.

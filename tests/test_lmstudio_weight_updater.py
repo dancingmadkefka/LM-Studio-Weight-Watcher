@@ -322,6 +322,51 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old")
             self.assertFalse(plan.artifacts[0].backup_path.exists())
 
+    def test_size_mismatch_leaves_installed_file_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, _contents = self.make_plan(
+                Path(tmp), [("model.gguf", b"old", b"right")]
+            )
+            downloader = FakeDownloader({"model.gguf": b"wrong-size"})
+            with self.assertRaisesRegex(IntegrityError, "Size mismatch"):
+                UpdateExecutor(plan, downloader=downloader).execute(
+                    post_install_validator=lambda _plan: None
+                )
+            self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old")
+            self.assertFalse(plan.artifacts[0].backup_path.exists())
+
+    def test_partial_staging_download_resumes_and_installs_verified_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("model.gguf", b"old", b"new-complete-bytes")]
+            )
+            artifact = plan.artifacts[0]
+            prefix = b"new-com"
+            artifact.staged_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact.staged_path.write_bytes(prefix)
+
+            class ResumingDownloader:
+                def __init__(self) -> None:
+                    self.saw_prefix = False
+
+                def download(self, current, *, cancellation, progress):
+                    cancellation.raise_if_cancelled()
+                    existing = current.staged_path.read_bytes()
+                    self.saw_prefix = existing == prefix
+                    complete = contents[current.remote_file]
+                    current.staged_path.write_bytes(existing + complete[len(existing):])
+                    progress(len(complete), len(complete))
+                    return current.staged_path
+
+            downloader = ResumingDownloader()
+            result = UpdateExecutor(plan, downloader=downloader).execute(
+                post_install_validator=lambda _plan: None
+            )
+
+            self.assertTrue(result.success)
+            self.assertTrue(downloader.saw_prefix)
+            self.assertEqual(artifact.destination.read_bytes(), b"new-complete-bytes")
+
     def test_post_install_failure_rolls_back_all_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, plan, contents = self.make_plan(
@@ -594,6 +639,7 @@ class CliTests(unittest.TestCase):
                 artifacts=[artifact_result(destination=target, remote_file="model.gguf", content=b"new")],
             )
             stderr = io.StringIO()
+            stdout = io.StringIO()
             with (
                 patch("lmstudio_weight_updater.discover_models_root", return_value=root),
                 patch("lmstudio_weight_updater.collect_check_results", return_value=[result]),
@@ -604,6 +650,7 @@ class CliTests(unittest.TestCase):
                     ),
                 ),
                 contextlib.redirect_stderr(stderr),
+                contextlib.redirect_stdout(stdout),
             ):
                 code = main(
                     [

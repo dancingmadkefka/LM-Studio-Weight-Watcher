@@ -764,7 +764,9 @@ def compare_artifact(
             "missing-local",
             local_size=None,
             local_oid=None,
-            local_path=None,
+            # Preserve the expected destination so recovery/update tooling can
+            # repair an incomplete shard set without guessing a filename.
+            local_path=str(artifact.local_path),
             message=f"{artifact.label}: expected file not found on disk.",
         )
 
@@ -982,6 +984,29 @@ def get_local_oid(
         "sha256": sha256,
     }
     return sha256
+
+
+def cache_verified_oid(
+    path: Path,
+    sha256: str,
+    hash_cache: dict[str, dict[str, Any]],
+    *,
+    models_root: Path | None = None,
+) -> str:
+    """Seed the local hash cache after an external full-file verification.
+
+    The updater hashes staged bytes before installation. Recording that verified
+    identity against the destination's final stat avoids immediately reading a
+    multi-gigabyte model a second time during the post-install checker pass.
+    """
+    stat = path.stat()
+    key = _hash_cache_key(path, models_root)
+    hash_cache[key] = {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": sha256,
+    }
+    return key
 
 
 def _hash_cache_key(path: Path, models_root: Path | None) -> str:

@@ -1,16 +1,18 @@
 from __future__ import annotations  
   
 import argparse
+from copy import deepcopy
 import os
 import shutil
 import sys
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass  
 from datetime import datetime, timedelta, timezone  
 from pathlib import Path  
 import tkinter as tk  
-from tkinter import ttk, font as tkfont  
+from tkinter import ttk, font as tkfont, messagebox
   
 import pystray  
 from PIL import Image, ImageDraw, ImageFont  
@@ -24,6 +26,9 @@ from lmstudio_alert_state import (
     load_state,
     pending_alerts,
     record_reminder,
+    record_update_finished,
+    record_update_progress,
+    record_update_started,
     reminder_due,
     save_state,
     snooze_alerts,
@@ -39,6 +44,19 @@ from lmstudio_weight_checker import (
     save_hash_cache,  
     run_check,  
 )  
+from lmstudio_weight_updater import (
+    CancellationToken,
+    InstallError,
+    ProgressEvent,
+    UpdateCancelled,
+    UpdateExecutor,
+    UpdatePlan,
+    build_update_plan,
+    collect_check_results,
+    format_bytes,
+    recover_interrupted_jobs,
+    redact_sensitive,
+)
   
 DEFAULT_CHECK_INTERVAL_HOURS = 6  
 DEFAULT_REMINDER_INTERVAL_MINUTES = 60  
@@ -71,6 +89,21 @@ class CheckOutcome:
     results: list  
     error: str | None  
     generated_at_utc: datetime  
+
+
+@dataclass
+class UpdateWorkerOutcome:
+    success: bool
+    cancelled: bool
+    message: str
+    results: list
+
+
+@dataclass
+class RecoveryWorkerOutcome:
+    models_root: Path | None
+    actions: list
+    error: str | None
   
   
 def parse_args() -> argparse.Namespace:  
@@ -248,6 +281,19 @@ class WatcherApp:
         self.state = load_state(state_path)  
         self.last_models_root = None  
         self.check_in_progress = False  
+        self.recovery_in_progress = False
+        self.update_in_progress = False
+        self.update_cancellable = False
+        self.update_cancellation: CancellationToken | None = None
+        self.update_thread: threading.Thread | None = None
+        self.update_commit_started = threading.Event()
+        self.update_model_status: dict[str, str] = {}
+        self.active_update_plan: UpdatePlan | None = None
+        self.last_update_phase: str | None = None
+        self.last_update_state_save_monotonic = 0.0
+        self.last_progress_post_monotonic = 0.0
+        self.last_progress_post_phase: str | None = None
+        self.quit_after_update = False
         self.shutting_down = False  
         self.next_check_token = None  
         self.topmost_reset_token = None  
@@ -266,6 +312,7 @@ class WatcherApp:
         self.checked_count_var = tk.StringVar(master=self.root, value="0")  
         self.status_var = tk.StringVar(master=self.root, value="Starting...")  
         self.selection_var = tk.StringVar(master=self.root, value="No selection")
+        self.update_progress_var = tk.DoubleVar(master=self.root, value=0.0)
         self._alerts_by_key: dict[str, dict] = {}  
   
         self.icon = pystray.Icon(  
@@ -281,9 +328,10 @@ class WatcherApp:
         self.root.mainloop()  
   
     def after_start(self) -> None:  
-        self.refresh_ui()  
-        self.run_check_async(reschedule=True)  
-        self.maybe_raise_pending_window(force=False)  
+        self.recovery_in_progress = True
+        self.status_var.set("Checking for an interrupted update...")
+        self.refresh_ui()
+        threading.Thread(target=self.recovery_worker, daemon=True).start()
   
     # ----- Tray menu -----  
   
@@ -292,6 +340,8 @@ class WatcherApp:
             pystray.MenuItem(lambda item: self.menu_status_text(), None, enabled=False),  
             pystray.MenuItem("Open Alerts", self.on_open_alerts, default=True),  
             pystray.MenuItem("Check Now", self.on_check_now),  
+            pystray.MenuItem("Update All Pending", self.on_update_all),
+            pystray.MenuItem("Cancel Update", self.on_cancel_update),
             pystray.MenuItem("Acknowledge All", self.on_acknowledge_all),  
             pystray.MenuItem(  
                 lambda item: f"Snooze All ({self.snooze_hours}h)",  
@@ -306,6 +356,10 @@ class WatcherApp:
         pending_count = len(pending_alerts(self.state, now_utc))  
         summary = self.state.get("last_summary", {})  
         checked = summary.get("checked", 0)  
+        if self.recovery_in_progress:
+            return "Checking interrupted update recovery..."
+        if self.update_in_progress:
+            return f"Updating models... ({pending_count} pending)"
         if self.check_in_progress:  
             return f"Checking models... (last total {checked})"  
         return f"{pending_count} pending · {checked} models tracked"  
@@ -315,6 +369,12 @@ class WatcherApp:
   
     def on_check_now(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  
         self.root.after(0, lambda: self.run_check_async(reschedule=True))  
+
+    def on_update_all(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self.root.after(0, self.update_all_pending)
+
+    def on_cancel_update(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self.root.after(0, self.cancel_update)
   
     def on_acknowledge_all(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  
         self.root.after(0, self.acknowledge_all)  
@@ -328,8 +388,16 @@ class WatcherApp:
     # ----- Checking -----  
   
     def run_check_async(self, *, reschedule: bool) -> None:  
-        if self.check_in_progress:  
+        if self.check_in_progress:
             return  
+        if self.recovery_in_progress:
+            if reschedule:
+                self.schedule_next_check()
+            return
+        if self.update_in_progress:
+            if reschedule:
+                self.schedule_next_check()
+            return
         self.check_in_progress = True  
         self.status_var.set("Checking for remote updates...")  
         self.refresh_tray_icon()  
@@ -356,6 +424,7 @@ class WatcherApp:
         if self.shutting_down:  
             return  
         self.check_in_progress = False  
+        self.update_model_status = {}
         self.last_models_root = outcome.models_root  
         self.state = apply_results(  
             self.state,  
@@ -382,6 +451,392 @@ class WatcherApp:
             self.next_check_token = None  
         delay_ms = int(self.check_interval.total_seconds() * 1000)  
         self.next_check_token = self.root.after(delay_ms, lambda: self.run_check_async(reschedule=True))  
+
+    # ----- Updating -----
+
+    def recovery_worker(self) -> None:
+        models_root = None
+        actions = []
+        error = None
+        try:
+            models_root = discover_models_root(self.models_root_override)
+            actions = recover_interrupted_jobs(models_root)
+        except Exception as exc:
+            error = redact_sensitive(exc)
+        if self.shutting_down:
+            return
+        outcome = RecoveryWorkerOutcome(models_root, actions, error)
+        try:
+            self.root.after(0, lambda: self.finish_recovery(outcome))
+        except (RuntimeError, tk.TclError):
+            return
+
+    def finish_recovery(self, outcome: RecoveryWorkerOutcome) -> None:
+        if self.shutting_down:
+            return
+        self.recovery_in_progress = False
+        self.last_models_root = outcome.models_root
+        if outcome.error:
+            self.status_var.set(f"Recovery check failed: {outcome.error}")
+        active = self.state.get("active_update")
+        if not outcome.error and isinstance(active, dict):
+            restored = sum(action.action == "restored" for action in outcome.actions)
+            message = "Previous update was interrupted."
+            if restored:
+                message += f" Restored {restored} file(s) from rollback."
+            elif outcome.actions:
+                message += " Recovery details require attention."
+            self.state = record_update_finished(
+                self.state,
+                success=False,
+                message=message,
+                now_utc=datetime.now(timezone.utc),
+            )
+            save_state(self.state_path, self.state)
+            self.status_var.set(message)
+        self.refresh_ui()
+        if self.quit_after_update:
+            self.quit_after_update = False
+            self.quit()
+            return
+        self.run_check_async(reschedule=True)
+        self.maybe_raise_pending_window(force=False)
+
+    def update_selected(self) -> None:
+        self.prepare_update_async(self.selected_model_keys())
+
+    def update_all_pending(self) -> None:
+        keys = [
+            alert.get("model_key")
+            for alert in pending_alerts(self.state, datetime.now(timezone.utc))
+            if alert.get("model_key")
+        ]
+        self.prepare_update_async(keys)
+
+    def prepare_update_async(self, model_keys: list[str]) -> None:
+        if (
+            self.recovery_in_progress
+            or self.check_in_progress
+            or self.update_in_progress
+            or isinstance(self.state.get("active_update"), dict)
+            or not model_keys
+        ):
+            return
+        alerts = [
+            deepcopy(self.state.get("alerts", {}).get(key))
+            for key in model_keys
+            if isinstance(self.state.get("alerts", {}).get(key), dict)
+        ]
+        if not alerts:
+            self.status_var.set("Select one or more model alerts to update.")
+            return
+        self.update_in_progress = True
+        self.update_commit_started.clear()
+        self.update_cancellable = True
+        self.update_cancellation = CancellationToken()
+        self.update_model_status = {key: "Queued" for key in model_keys}
+        self.status_var.set("Preparing update plan...")
+        self.update_progress_var.set(0.0)
+        self.refresh_ui()
+        self.update_thread = threading.Thread(
+            target=self.prepare_update_worker,
+            args=(alerts,),
+            daemon=True,
+        )
+        self.update_thread.start()
+
+    def prepare_update_worker(self, alerts: list[dict]) -> None:
+        plan = None
+        error = None
+        try:
+            models_root = discover_models_root(self.models_root_override)
+            plan = build_update_plan(alerts, models_root=models_root)
+            if self.update_cancellation is not None:
+                self.update_cancellation.raise_if_cancelled()
+        except Exception as exc:
+            error = redact_sensitive(exc)
+        if self.shutting_down:
+            return
+        try:
+            self.root.after(0, lambda: self.finish_prepare_update(plan, error))
+        except (RuntimeError, tk.TclError):
+            return
+
+    def finish_prepare_update(self, plan: UpdatePlan | None, error: str | None) -> None:
+        if self.shutting_down:
+            return
+        if error or plan is None:
+            self.update_in_progress = False
+            self.update_cancellable = False
+            self.update_cancellation = None
+            cancelled = error and "cancel" in error.lower()
+            self.update_model_status = {
+                key: (
+                    "Cancelled"
+                    if cancelled
+                    else f"Failed · {error or 'Could not build update plan'}"
+                )
+                for key in self.update_model_status
+            }
+            self.status_var.set(
+                "Update cancelled before download."
+                if cancelled
+                else f"Update not started: {error or 'unknown planning error'}"
+            )
+            self.refresh_ui()
+            return
+        self.active_update_plan = plan
+        self.last_models_root = plan.models_root
+        details = [
+            f"Models: {len(plan.selected_model_keys)}",
+            f"Files: {len(plan.artifacts)}",
+            f"Download remaining: {format_bytes(plan.remaining_download_bytes)}",
+            f"Total verified install: {format_bytes(plan.total_bytes)}",
+            f"Available space: {format_bytes(plan.available_bytes)}",
+            "",
+        ]
+        details.extend(f"• {name}" for name in plan.selected_model_names)
+        commit_titles = sorted(
+            {
+                str(self.state.get("alerts", {}).get(key, {}).get("last_commit_title"))
+                for key in plan.selected_model_keys
+                if self.state.get("alerts", {}).get(key, {}).get("last_commit_title")
+            }
+        )
+        if commit_titles:
+            details.extend(["", "Upstream changes:"])
+            details.extend(f"• {title}" for title in commit_titles)
+        try:
+            confirmed = messagebox.askyesno(
+                "Confirm model update",
+                "\n".join(details),
+                parent=self.window if self.window and self.window.winfo_exists() else None,
+            )
+        except tk.TclError as exc:
+            self.update_in_progress = False
+            self.update_cancellable = False
+            self.update_cancellation = None
+            self.update_model_status = {
+                key: "Failed · confirmation window unavailable"
+                for key in self.update_model_status
+            }
+            self.active_update_plan = None
+            self.status_var.set(
+                f"Update not started: confirmation window unavailable ({redact_sensitive(exc)})"
+            )
+            self.refresh_ui()
+            return
+        if not confirmed:
+            self.update_in_progress = False
+            self.update_cancellable = False
+            self.update_cancellation = None
+            self.update_model_status = {}
+            self.active_update_plan = None
+            self.status_var.set("Update cancelled before download.")
+            self.refresh_ui()
+            return
+
+        self.update_cancellation = self.update_cancellation or CancellationToken()
+        self.last_update_phase = "queued"
+        self.state = record_update_started(
+            self.state,
+            job_id=plan.job_id,
+            model_keys=plan.selected_model_keys,
+            model_names=plan.selected_model_names,
+            total_bytes=plan.total_bytes,
+            now_utc=datetime.now(timezone.utc),
+        )
+        save_state(self.state_path, self.state)
+        self.status_var.set("Update queued...")
+        self.update_thread = threading.Thread(
+            target=self.update_worker,
+            args=(plan, self.update_cancellation),
+            daemon=True,
+        )
+        self.update_thread.start()
+        self.refresh_ui()
+
+    def update_worker(self, plan: UpdatePlan, cancellation: CancellationToken) -> None:
+        hash_cache = load_hash_cache(self.hash_cache_path)
+        latest_results: list = []
+
+        def validate(completed_plan: UpdatePlan) -> None:
+            nonlocal latest_results
+            latest_results = collect_check_results(
+                models_root=completed_plan.models_root,
+                timeout_seconds=self.timeout_seconds,
+                hash_cache=hash_cache,
+            )
+            by_key = {result.model_key: result for result in latest_results}
+            failures = [
+                f"{key}: {by_key.get(key).status if by_key.get(key) else 'missing'}"
+                for key in completed_plan.selected_model_keys
+                if key not in by_key or by_key[key].status != "up-to-date"
+            ]
+            if failures:
+                raise InstallError(
+                    "Post-install checker did not confirm success: " + ", ".join(failures)
+                )
+
+        try:
+            result = UpdateExecutor(
+                plan,
+                cancellation=cancellation,
+                progress=self.post_update_progress,
+                hash_cache=hash_cache,
+            ).execute(post_install_validator=validate)
+            outcome = UpdateWorkerOutcome(True, False, result.message, latest_results)
+        except UpdateCancelled as exc:
+            outcome = UpdateWorkerOutcome(False, True, redact_sensitive(exc), [])
+        except Exception as exc:
+            try:
+                latest_results = collect_check_results(
+                    models_root=plan.models_root,
+                    timeout_seconds=self.timeout_seconds,
+                    hash_cache=hash_cache,
+                )
+            except Exception:
+                latest_results = []
+            outcome = UpdateWorkerOutcome(False, False, redact_sensitive(exc), latest_results)
+        finally:
+            save_hash_cache(self.hash_cache_path, hash_cache)
+
+        if self.shutting_down:
+            return
+        try:
+            self.root.after(0, lambda: self.finish_update(outcome))
+        except (RuntimeError, tk.TclError):
+            return
+
+    def post_update_progress(self, event: ProgressEvent) -> None:
+        if self.shutting_down:
+            return
+        if not event.cancellable:
+            # This runs synchronously on the update worker before the executor
+            # touches installed files, closing the gap before Tk handles the event.
+            self.update_commit_started.set()
+        now = time.monotonic()
+        completed = event.bytes_total > 0 and event.bytes_completed >= event.bytes_total
+        if (
+            event.phase == self.last_progress_post_phase
+            and not completed
+            and now - self.last_progress_post_monotonic < 0.1
+        ):
+            return
+        self.last_progress_post_phase = event.phase
+        self.last_progress_post_monotonic = now
+        try:
+            self.root.after(0, lambda event=event: self.handle_update_progress(event))
+        except (RuntimeError, tk.TclError):
+            return
+
+    def handle_update_progress(self, event: ProgressEvent) -> None:
+        if self.shutting_down:
+            return
+        self.update_cancellable = event.cancellable
+        status_text = {
+            "queued": "Queued",
+            "downloading": "Downloading",
+            "verifying": "Verifying",
+            "installing": "Installing",
+            "validating": "Validating",
+            "completed": "Updated",
+            "cancelled": "Cancelled",
+            "failed": "Failed",
+        }.get(event.phase, event.phase.replace("-", " ").title())
+        for key in event.model_keys or tuple(self.update_model_status):
+            self.update_model_status[key] = status_text
+        if event.bytes_total:
+            self.update_progress_var.set(
+                min(100.0, 100.0 * event.bytes_completed / event.bytes_total)
+            )
+            self.status_var.set(
+                f"{event.message} · {format_bytes(event.bytes_completed)} / "
+                f"{format_bytes(event.bytes_total)}"
+            )
+        else:
+            self.status_var.set(event.message)
+        phase_changed = event.phase != self.last_update_phase
+        now_monotonic = time.monotonic()
+        if phase_changed or now_monotonic - self.last_update_state_save_monotonic >= 2.0:
+            self.last_update_phase = event.phase
+            self.last_update_state_save_monotonic = now_monotonic
+            self.state = record_update_progress(
+                self.state,
+                phase=event.phase,
+                message=redact_sensitive(event.message),
+                bytes_completed=event.bytes_completed,
+                bytes_total=event.bytes_total,
+                cancellable=event.cancellable,
+                now_utc=datetime.now(timezone.utc),
+            )
+            save_state(self.state_path, self.state)
+        if phase_changed:
+            self.refresh_ui()
+        else:
+            self._refresh_action_states()
+
+    def finish_update(self, outcome: UpdateWorkerOutcome) -> None:
+        if self.shutting_down:
+            return
+        self.update_in_progress = False
+        self.update_cancellable = False
+        self.update_cancellation = None
+        self.update_thread = None
+        self.update_commit_started.clear()
+        self.active_update_plan = None
+        now_utc = datetime.now(timezone.utc)
+        if outcome.results:
+            self.state = apply_results(
+                self.state,
+                outcome.results,
+                now_utc=now_utc,
+                last_error=None,
+            )
+        self.state = record_update_finished(
+            self.state,
+            success=outcome.success,
+            cancelled=outcome.cancelled,
+            message=redact_sensitive(outcome.message),
+            now_utc=now_utc,
+        )
+        save_state(self.state_path, self.state)
+        if outcome.success:
+            self.status_var.set(outcome.message)
+            self.update_model_status = {
+                key: "Updated" for key in self.update_model_status
+            }
+            self.update_progress_var.set(100.0)
+        elif outcome.cancelled:
+            self.status_var.set("Update cancelled; installed files were not changed.")
+            self.update_progress_var.set(0.0)
+            self.update_model_status = {
+                key: "Cancelled" for key in self.update_model_status
+            }
+        else:
+            guidance = "Waiting for model unload" if "Unload the model" in outcome.message else "Failed"
+            self.status_var.set(f"Update failed: {outcome.message}")
+            self.update_model_status = {
+                key: guidance for key in self.update_model_status
+            }
+        self.schedule_next_check()
+        self.refresh_ui()
+        if self.quit_after_update:
+            self.quit_after_update = False
+            self.quit()
+
+    def cancel_update(self) -> None:
+        if (
+            not self.update_in_progress
+            or not self.update_cancellable
+            or self.update_commit_started.is_set()
+        ):
+            return
+        if self.update_cancellation is not None:
+            self.update_cancellation.cancel()
+        self.update_cancellable = False
+        self.status_var.set("Cancelling update safely...")
+        self.refresh_ui()
   
     def maybe_raise_pending_window(self, *, force: bool) -> None:  
         now_utc = datetime.now(timezone.utc)  
@@ -606,7 +1061,7 @@ class WatcherApp:
         self.tree.tag_configure("empty", foreground=COLOR_MUTED)  
   
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)  
-        self.tree.bind("<Double-1>", lambda e: self.acknowledge_selected())  
+        self.tree.bind("<Double-1>", lambda e: self.update_selected())
 
         detail_card = tk.Frame(
             alerts_card,
@@ -655,8 +1110,31 @@ class WatcherApp:
         # Left group: primary  
         left = ttk.Frame(toolbar, style="Toolbar.TFrame")  
         left.pack(side=tk.LEFT)  
-        ttk.Button(left, text="↻  Check Now",  
-                   command=lambda: self.run_check_async(reschedule=True)).pack(side=tk.LEFT)  
+        self.check_button = ttk.Button(
+            left,
+            text="↻  Check Now",
+            command=lambda: self.run_check_async(reschedule=True),
+        )
+        self.check_button.pack(side=tk.LEFT)
+        self.update_selected_button = ttk.Button(
+            left,
+            text="⇩  Update Selected",
+            style="Primary.TButton",
+            command=self.update_selected,
+        )
+        self.update_selected_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.update_all_button = ttk.Button(
+            left,
+            text="⇩  Update All Pending",
+            command=self.update_all_pending,
+        )
+        self.update_all_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.cancel_update_button = ttk.Button(
+            left,
+            text="Cancel Update",
+            command=self.cancel_update,
+        )
+        self.cancel_update_button.pack(side=tk.LEFT, padx=(6, 0))
   
         ttk.Separator(toolbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)  
   
@@ -726,6 +1204,14 @@ class WatcherApp:
         statusbar.pack(fill=tk.X, pady=(10, 0))  
         ttk.Label(statusbar, textvariable=self.status_var,  
                   style="Status.TLabel").pack(side=tk.LEFT)  
+        self.update_progressbar = ttk.Progressbar(
+            statusbar,
+            variable=self.update_progress_var,
+            maximum=100.0,
+            length=220,
+            mode="determinate",
+        )
+        self.update_progressbar.pack(side=tk.RIGHT)
   
     def _add_card_border(self, frame: ttk.Frame) -> None:  
         """Simulate a 1px card border using a tk.Frame highlight."""  
@@ -768,6 +1254,27 @@ class WatcherApp:
                 self._render_detail(None, selection_text=f"{count} models selected · uploaders: {', '.join(uploaders)}")
             else:
                 self._render_detail(None, selection_text=f"{count} models selected")
+        self._refresh_action_states()
+
+    def _refresh_action_states(self) -> None:
+        busy = self.recovery_in_progress or self.check_in_progress or self.update_in_progress
+        selected = bool(self.selected_model_keys())
+        pending = bool(pending_alerts(self.state, datetime.now(timezone.utc)))
+        controls = (
+            ("check_button", not busy),
+            ("update_selected_button", selected and not busy),
+            ("update_all_button", pending and not busy),
+            (
+                "cancel_update_button",
+                self.update_in_progress
+                and self.update_cancellable
+                and not self.update_commit_started.is_set(),
+            ),
+        )
+        for name, enabled in controls:
+            control = getattr(self, name, None)
+            if control is not None:
+                control.configure(state=tk.NORMAL if enabled else tk.DISABLED)
   
     def _render_detail(self, alert: dict | None, *, selection_text: str | None = None) -> None:
         if not hasattr(self, "detail_text"):
@@ -916,6 +1423,9 @@ class WatcherApp:
         self._on_tree_select()  
   
     def _format_status(self, alert: dict, status_raw: str, now_utc: datetime) -> str:  
+        update_status = self.update_model_status.get(alert.get("model_key"))
+        if update_status:
+            return update_status
         if status_raw == "pending":  
             return "Update available"  
         if status_raw == "snoozed":  
@@ -991,7 +1501,9 @@ class WatcherApp:
         self.checked_count_var.set(str(checked_count))  
   
         # Headline + subline  
-        if self.check_in_progress:  
+        if self.update_in_progress:
+            self.headline_var.set("Updating model weights...")
+        elif self.check_in_progress:
             self.headline_var.set("Checking for updates...")  
         elif pending_count > 0:  
             noun = "update" if pending_count == 1 else "updates"  
@@ -1015,8 +1527,7 @@ class WatcherApp:
     def selected_model_keys(self) -> list[str]:  
         if self.tree is None:  
             return []  
-        # Filter out the synthetic "empty" row (no iid given)  
-        return [iid for iid in self.tree.selection() if iid]  
+        return [iid for iid in self.tree.selection() if iid in self._alerts_by_key]
   
     def acknowledge_selected(self) -> None:  
         selected = self.selected_model_keys()  
@@ -1056,15 +1567,21 @@ class WatcherApp:
     def refresh_ui(self) -> None:  
         self.refresh_tree()  
         self.refresh_tray_icon()  
+        self._refresh_action_states()
   
     # ----- Tray icon -----  
   
     def refresh_tray_icon(self) -> None:  
         now_utc = datetime.now(timezone.utc)  
         pending_count = len(pending_alerts(self.state, now_utc))  
-        busy = self.check_in_progress  
+        busy = self.recovery_in_progress or self.check_in_progress or self.update_in_progress
         self.icon.icon = self.make_icon_image(pending_count, busy=busy)  
-        status_text = "checking" if busy else f"{pending_count} pending alerts"  
+        if self.update_in_progress:
+            status_text = "updating models"
+        elif self.check_in_progress:
+            status_text = "checking"
+        else:
+            status_text = f"{pending_count} pending alerts"
         last_checked = self.state.get("last_checked_utc") or "never"  
         self.icon.title = f"{APP_NAME}: {status_text} (last checked {last_checked})"  
         self.icon.update_menu()  
@@ -1102,6 +1619,28 @@ class WatcherApp:
     def quit(self) -> None:  
         if self.shutting_down:  
             return  
+        if getattr(self, "recovery_in_progress", False):
+            self.quit_after_update = True
+            if hasattr(self, "status_var"):
+                self.status_var.set(
+                    "Finishing recovery safely; the app will close afterward."
+                )
+            return
+        if getattr(self, "update_in_progress", False):
+            commit_started = getattr(self, "update_commit_started", None)
+            if (
+                not getattr(self, "update_cancellable", False)
+                or (commit_started is not None and commit_started.is_set())
+            ):
+                self.quit_after_update = True
+                if hasattr(self, "status_var"):
+                    self.status_var.set(
+                        "Finishing installation safely; the app will close afterward."
+                    )
+                return
+            cancellation = getattr(self, "update_cancellation", None)
+            if cancellation is not None:
+                cancellation.cancel()
         self.shutting_down = True  
         if self.topmost_reset_token is not None and self.window and self.window.winfo_exists():  
             try:  

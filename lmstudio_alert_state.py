@@ -10,10 +10,39 @@ from typing import Any
 
 from lmstudio_weight_checker import CheckResult, format_utc, parse_utc
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_SNOOZE_HOURS = 4
 APP_NAME = "LM Studio Weight Watcher"
 LEGACY_APP_NAME = "LM Studio Weight Updater"
+
+ALERT_STRING_FIELDS = (
+    "publisher",
+    "local_path",
+    "local_modified_utc",
+    "remote_repo",
+    "remote_file",
+    "remote_modified_utc",
+    "message",
+    "remote_sha256",
+    "hash_method",
+    "last_commit_title",
+    "fingerprint",
+    "first_detected_utc",
+    "last_detected_utc",
+    "snoozed_until_utc",
+)
+ARTIFACT_STRING_FIELDS = (
+    "kind",
+    "label",
+    "status",
+    "local_path",
+    "remote_file",
+    "local_oid",
+    "remote_oid",
+    "last_commit_title",
+    "last_commit_date_utc",
+    "message",
+)
 
 
 def default_state_path() -> Path:
@@ -37,7 +66,88 @@ def blank_state() -> dict[str, Any]:
         "last_reminder_utc": None,
         "alerts": {},
         "unresolved": [],
+        "active_update": None,
+        "last_update": None,
     }
+
+
+def _sanitize_alert(key: object, value: dict[str, Any]) -> dict[str, Any]:
+    """Return an alert safe for sorting, rendering, and update planning."""
+    alert = deepcopy(value)
+    fallback_key = str(key)
+    model_key = alert.get("model_key")
+    alert["model_key"] = model_key if isinstance(model_key, str) and model_key else fallback_key
+    display_name = alert.get("display_name")
+    alert["display_name"] = (
+        display_name
+        if isinstance(display_name, str) and display_name
+        else alert["model_key"]
+    )
+    for field in ALERT_STRING_FIELDS:
+        field_value = alert.get(field)
+        if field_value is not None and not isinstance(field_value, str):
+            alert[field] = None
+    status = alert.get("status")
+    if not isinstance(status, str) or status not in {
+        "pending",
+        "snoozed",
+        "acknowledged",
+    }:
+        alert["status"] = "pending"
+        alert["snoozed_until_utc"] = None
+    delta = alert.get("delta_seconds")
+    if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+        alert["delta_seconds"] = None
+
+    artifacts = alert.get("artifacts")
+    clean_artifacts: list[dict[str, Any]] = []
+    if isinstance(artifacts, list):
+        for artifact_value in artifacts:
+            if not isinstance(artifact_value, dict):
+                continue
+            artifact = deepcopy(artifact_value)
+            for field in ARTIFACT_STRING_FIELDS:
+                field_value = artifact.get(field)
+                if field_value is not None and not isinstance(field_value, str):
+                    artifact[field] = None
+            for field in ("local_size", "remote_size"):
+                field_value = artifact.get(field)
+                if isinstance(field_value, bool) or not isinstance(field_value, int):
+                    artifact[field] = None
+            clean_artifacts.append(artifact)
+    alert["artifacts"] = clean_artifacts
+    return alert
+
+
+def _safe_string_list(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _sanitize_update_summary(value: object, *, active: bool) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    summary = deepcopy(value)
+    for field in ("job_id", "phase", "message", "started_utc", "updated_utc", "completed_utc"):
+        field_value = summary.get(field)
+        if field_value is not None and not isinstance(field_value, str):
+            summary[field] = None
+    summary["model_keys"] = _safe_string_list(summary.get("model_keys"))
+    summary["model_names"] = _safe_string_list(summary.get("model_names"))
+    for field in ("bytes_completed", "bytes_total", "total_bytes"):
+        field_value = summary.get(field)
+        summary[field] = (
+            field_value
+            if isinstance(field_value, int) and not isinstance(field_value, bool) and field_value >= 0
+            else 0
+        )
+    if active:
+        summary["cancellable"] = bool(summary.get("cancellable"))
+    else:
+        summary["success"] = bool(summary.get("success"))
+        summary["cancelled"] = bool(summary.get("cancelled"))
+    return summary
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -52,19 +162,60 @@ def load_state(path: Path) -> dict[str, Any]:
     state = migrate_state(payload if isinstance(payload, dict) else {})
     if not isinstance(state.get("alerts"), dict):
         state["alerts"] = {}
+    else:
+        state["alerts"] = {
+            str(key): _sanitize_alert(key, alert)
+            for key, alert in state["alerts"].items()
+            if isinstance(alert, dict)
+        }
     if not isinstance(state.get("unresolved"), list):
         state["unresolved"] = []
+    else:
+        clean_unresolved = []
+        for raw_item in state["unresolved"]:
+            if not isinstance(raw_item, dict):
+                continue
+            item = deepcopy(raw_item)
+            for field in ("model_key", "display_name", "publisher", "message", "remote_repo"):
+                if not isinstance(item.get(field), str):
+                    item[field] = ""
+            clean_unresolved.append(item)
+        state["unresolved"] = clean_unresolved
     if not isinstance(state.get("last_summary"), dict):
         state["last_summary"] = blank_state()["last_summary"]
+    else:
+        summary = blank_state()["last_summary"]
+        for field in summary:
+            value = state["last_summary"].get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                summary[field] = value
+        state["last_summary"] = summary
+    state["active_update"] = _sanitize_update_summary(
+        state.get("active_update"), active=True
+    )
+    state["last_update"] = _sanitize_update_summary(
+        state.get("last_update"), active=False
+    )
+    reminder = state.get("last_reminder_utc")
+    if reminder is not None:
+        if not isinstance(reminder, str):
+            state["last_reminder_utc"] = None
+        else:
+            try:
+                parse_utc(reminder)
+            except (TypeError, ValueError):
+                state["last_reminder_utc"] = None
     return state
 
 
 def migrate_state(payload: dict[str, Any]) -> dict[str, Any]:
     state = blank_state()
     version = payload.get("version")
-    if version in (None, 1):
+    if version in (None, 1, 2):
         state.update(payload)
         state["version"] = STATE_VERSION
+        state.setdefault("active_update", None)
+        state.setdefault("last_update", None)
         return state
     return state
 
@@ -218,11 +369,22 @@ def fingerprint_for_result(result: CheckResult) -> str:
 
 
 def refresh_expired_snoozes(state: dict[str, Any], now_utc: datetime) -> None:
-    for alert in state.get("alerts", {}).values():
+    alerts = state.get("alerts", {})
+    if not isinstance(alerts, dict):
+        state["alerts"] = {}
+        return
+    for key, alert in list(alerts.items()):
+        if not isinstance(alert, dict):
+            del alerts[key]
+            continue
         if alert.get("status") != "snoozed":
             continue
         snoozed_until = alert.get("snoozed_until_utc")
-        if snoozed_until and parse_utc(snoozed_until) <= now_utc:
+        try:
+            expired = bool(snoozed_until) and parse_utc(str(snoozed_until)) <= now_utc
+        except (TypeError, ValueError):
+            expired = True
+        if expired:
             alert["status"] = "pending"
             alert["snoozed_until_utc"] = None
 
@@ -287,6 +449,83 @@ def snooze_alerts(
 def record_reminder(state: dict[str, Any], now_utc: datetime) -> dict[str, Any]:
     next_state = deepcopy(state)
     next_state["last_reminder_utc"] = format_utc(now_utc)
+    return next_state
+
+
+def record_update_started(
+    state: dict[str, Any],
+    *,
+    job_id: str,
+    model_keys: list[str] | tuple[str, ...],
+    model_names: list[str] | tuple[str, ...],
+    total_bytes: int,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    next_state = deepcopy(state)
+    next_state["version"] = STATE_VERSION
+    next_state["active_update"] = {
+        "job_id": job_id,
+        "model_keys": list(model_keys),
+        "model_names": list(model_names),
+        "phase": "queued",
+        "message": "Update queued",
+        "bytes_completed": 0,
+        "bytes_total": total_bytes,
+        "cancellable": True,
+        "started_utc": format_utc(now_utc),
+        "updated_utc": format_utc(now_utc),
+    }
+    return next_state
+
+
+def record_update_progress(
+    state: dict[str, Any],
+    *,
+    phase: str,
+    message: str,
+    bytes_completed: int,
+    bytes_total: int,
+    cancellable: bool,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    next_state = deepcopy(state)
+    active = next_state.get("active_update")
+    if not isinstance(active, dict):
+        return next_state
+    active.update(
+        {
+            "phase": phase,
+            "message": message,
+            "bytes_completed": max(0, int(bytes_completed)),
+            "bytes_total": max(0, int(bytes_total)),
+            "cancellable": bool(cancellable),
+            "updated_utc": format_utc(now_utc),
+        }
+    )
+    return next_state
+
+
+def record_update_finished(
+    state: dict[str, Any],
+    *,
+    success: bool,
+    message: str,
+    now_utc: datetime,
+    cancelled: bool = False,
+) -> dict[str, Any]:
+    next_state = deepcopy(state)
+    active = next_state.get("active_update")
+    summary = active if isinstance(active, dict) else {}
+    next_state["last_update"] = {
+        "job_id": summary.get("job_id"),
+        "model_keys": _safe_string_list(summary.get("model_keys")),
+        "model_names": _safe_string_list(summary.get("model_names")),
+        "success": bool(success),
+        "cancelled": bool(cancelled),
+        "message": message,
+        "completed_utc": format_utc(now_utc),
+    }
+    next_state["active_update"] = None
     return next_state
 
 

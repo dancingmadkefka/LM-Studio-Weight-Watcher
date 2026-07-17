@@ -91,6 +91,7 @@ class ProgressEvent:
     bytes_completed: int = 0
     bytes_total: int = 0
     cancellable: bool = True
+    model_keys: tuple[str, ...] = ()
 
 
 ProgressCallback = Callable[[ProgressEvent], None]
@@ -643,6 +644,7 @@ class UpdateExecutor:
                     bytes_completed=completed,
                     bytes_total=total,
                     cancellable=cancellable,
+                    model_keys=artifact.model_keys if artifact else (),
                 )
             )
         except Exception:
@@ -692,15 +694,19 @@ class UpdateExecutor:
                     ),
                 )
 
-            self.cancellation.raise_if_cancelled()
-            write_manifest(
-                self.plan, "installing", owned_staging_files=owned_staging_files
-            )
             self._emit(
                 "installing",
                 "Installing verified artifacts",
                 total=len(self.plan.artifacts),
                 cancellable=False,
+            )
+            # Publish the non-cancellable boundary synchronously before the
+            # final cancellation check. A cancellation that already won still
+            # aborts here; otherwise observers know shutdown must defer before
+            # any manifest/install filesystem mutation begins.
+            self.cancellation.raise_if_cancelled()
+            write_manifest(
+                self.plan, "installing", owned_staging_files=owned_staging_files
             )
             for index, artifact in enumerate(self.plan.artifacts, start=1):
                 artifact.destination.parent.mkdir(parents=True, exist_ok=True)

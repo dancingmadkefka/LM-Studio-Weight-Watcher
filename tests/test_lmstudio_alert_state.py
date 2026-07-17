@@ -11,6 +11,9 @@ from lmstudio_alert_state import (
     load_state,
     pending_alerts,
     reminder_due,
+    record_update_finished,
+    record_update_progress,
+    record_update_started,
     snooze_alerts,
 )
 from lmstudio_weight_checker import CheckResult
@@ -115,6 +118,94 @@ class ReminderTests(unittest.TestCase):
 
 
 class StateMigrationTests(unittest.TestCase):
+    def test_corrupt_state_falls_back_to_blank_state(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text('{"version": 2, broken', encoding="utf-8")
+
+            state = load_state(path)
+
+        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["alerts"], {})
+        self.assertIsNone(state["active_update"])
+
+    def test_structurally_corrupt_alert_entries_are_discarded(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text(
+                '{"version": 1, "alerts": {"broken": null, "also-broken": 7}}',
+                encoding="utf-8",
+            )
+
+            state = load_state(path)
+            pending = pending_alerts(state, datetime.now(timezone.utc))
+
+        self.assertEqual(state["alerts"], {})
+        self.assertEqual(pending, [])
+
+    def test_invalid_snooze_timestamp_reactivates_safely(self) -> None:
+        state = {
+            "alerts": {
+                "model": {
+                    "status": "snoozed",
+                    "snoozed_until_utc": "not-a-time",
+                }
+            }
+        }
+        alerts = pending_alerts(state, datetime.now(timezone.utc))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["status"], "pending")
+
+    def test_dictionary_alert_fields_are_sanitized_for_sorting_and_ui(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text(
+                '{"version": 1, "alerts": {'
+                '"one": {"model_key": [], "display_name": {}, '
+                '"remote_modified_utc": ["bad"], "status": "pending"}, '
+                '"two": {"remote_modified_utc": "2026-07-17T12:00:00Z", '
+                '"status": "pending", "artifacts": [null, {"remote_size": []}]}'
+                '}, "unresolved": [null, {"message": "kept"}], '
+                '"last_summary": {"checked": "many"}}',
+                encoding="utf-8",
+            )
+
+            state = load_state(path)
+            alerts = pending_alerts(state, datetime.now(timezone.utc))
+
+        self.assertEqual({alert["model_key"] for alert in alerts}, {"one", "two"})
+        self.assertTrue(all(isinstance(alert["display_name"], str) for alert in alerts))
+        self.assertIsNone(state["alerts"]["one"]["remote_modified_utc"])
+        self.assertEqual(state["alerts"]["two"]["artifacts"][0]["remote_size"], None)
+        self.assertEqual(state["unresolved"][0]["message"], "kept")
+        self.assertEqual(state["last_summary"]["checked"], 0)
+
+    def test_container_status_unresolved_and_active_update_are_sanitized(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text(
+                '{"version": 2, "alerts": {"model": {"status": []}}, '
+                '"unresolved": [{"remote_repo": ["bad"], "message": {}}], '
+                '"active_update": {"job_id": 4, "model_keys": 7, '
+                '"model_names": ["Model", null]}, "last_reminder_utc": []}',
+                encoding="utf-8",
+            )
+            state = load_state(path)
+            finished = record_update_finished(
+                state,
+                success=False,
+                message="Recovered",
+                now_utc=datetime.now(timezone.utc),
+            )
+
+        self.assertEqual(state["alerts"]["model"]["status"], "pending")
+        self.assertEqual(state["unresolved"][0]["remote_repo"], "")
+        self.assertEqual(state["unresolved"][0]["message"], "")
+        self.assertEqual(state["active_update"]["model_keys"], [])
+        self.assertEqual(state["active_update"]["model_names"], ["Model"])
+        self.assertIsNone(state["last_reminder_utc"])
+        self.assertEqual(finished["last_update"]["model_keys"], [])
+
     def test_unknown_state_version_falls_back_to_blank_state(self) -> None:
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
@@ -122,8 +213,52 @@ class StateMigrationTests(unittest.TestCase):
 
             state = load_state(path)
 
-        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["version"], 2)
         self.assertEqual(state["alerts"], {})
+
+    def test_v1_state_migrates_without_losing_snoozed_alert(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text(
+                '{"version": 1, "alerts": {"x": {"status": "snoozed", '
+                '"snoozed_until_utc": "2026-07-18T00:00:00Z"}}}',
+                encoding="utf-8",
+            )
+            state = load_state(path)
+        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["alerts"]["x"]["status"], "snoozed")
+        self.assertIsNone(state["active_update"])
+        self.assertIsNone(state["last_update"])
+
+    def test_update_lifecycle_is_bounded_and_clears_active_state(self) -> None:
+        now = datetime(2026, 7, 17, 18, 0, tzinfo=timezone.utc)
+        state = record_update_started(
+            {},
+            job_id="job-1",
+            model_keys=["model"],
+            model_names=["Model"],
+            total_bytes=100,
+            now_utc=now,
+        )
+        state = record_update_progress(
+            state,
+            phase="downloading",
+            message="Downloading",
+            bytes_completed=25,
+            bytes_total=100,
+            cancellable=True,
+            now_utc=now + timedelta(minutes=1),
+        )
+        self.assertEqual(state["active_update"]["bytes_completed"], 25)
+        state = record_update_finished(
+            state,
+            success=True,
+            message="Done",
+            now_utc=now + timedelta(minutes=2),
+        )
+        self.assertIsNone(state["active_update"])
+        self.assertTrue(state["last_update"]["success"])
+        self.assertEqual(state["last_update"]["model_keys"], ["model"])
 
 
 if __name__ == "__main__":

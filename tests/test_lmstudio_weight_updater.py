@@ -392,6 +392,26 @@ class ExecutionTests(unittest.TestCase):
                 ).execute(post_install_validator=lambda _plan: None)
             self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old")
 
+    def test_cancellation_wins_at_non_cancellable_handoff_before_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("model.gguf", b"old", b"new")]
+            )
+            token = CancellationToken()
+
+            def cancel_at_handoff(event):
+                if event.phase == "installing":
+                    token.cancel()
+
+            with self.assertRaises(UpdateCancelled):
+                UpdateExecutor(
+                    plan,
+                    downloader=FakeDownloader(contents),
+                    cancellation=token,
+                    progress=cancel_at_handoff,
+                ).execute(post_install_validator=lambda _plan: None)
+            self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old")
+
     def test_manifest_contains_recovery_metadata_but_no_signed_urls_or_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, plan, _contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])

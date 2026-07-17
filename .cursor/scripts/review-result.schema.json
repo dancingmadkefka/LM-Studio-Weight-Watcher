@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "milestone": {
+      "type": "string"
+    },
+    "candidate_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "reviewer_model": {
+      "type": "string"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "NEEDS-REVISION"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["code", "human", "spec"]
+          },
+          "requirement_level": {
+            "type": "string",
+            "enum": ["MUST", "SHOULD"]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["PASS", "FAIL", "UNVERIFIED"]
+          },
+          "description": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "requirement_level",
+          "status",
+          "description",
+          "evidence"
+        ]
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["code", "human", "spec"]
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["MUST", "SHOULD"]
+          },
+          "description": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "severity",
+          "description",
+          "evidence"
+        ]
+      }
+    },
+    "deferred": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": [
+    "milestone",
+    "candidate_commit",
+    "reviewer_model",
+    "verdict",
+    "summary",
+    "checks",
+    "blockers",
+    "deferred"
+  ]
+}

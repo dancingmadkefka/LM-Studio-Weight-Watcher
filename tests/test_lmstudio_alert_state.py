@@ -16,7 +16,8 @@ from lmstudio_alert_state import (
     record_update_started,
     snooze_alerts,
 )
-from lmstudio_weight_checker import CheckResult
+from lmstudio_weight_checker import ArtifactResult, CheckResult
+from lmstudio_weight_updater import PlanError, build_update_plan
 
 
 def make_result(
@@ -25,6 +26,7 @@ def make_result(
     remote_modified_utc: str = "2026-04-18T01:00:00Z",
     status: str = "update-available",
     remote_sha256: str | None = None,
+    message: str = "Remote file is newer than the installed LM Studio file.",
 ) -> CheckResult:
     return CheckResult(
         model_key=model_key,
@@ -37,7 +39,7 @@ def make_result(
         remote_file="test.gguf",
         remote_modified_utc=remote_modified_utc,
         delta_seconds=3600,
-        message="Remote file is newer than the installed LM Studio file.",
+        message=message,
         remote_sha256=remote_sha256,
     )
 
@@ -99,6 +101,56 @@ class ApplyResultsTests(unittest.TestCase):
         )
 
         self.assertNotIn("test-model", refreshed["alerts"])
+
+    def test_removed_remote_is_tracked_and_counted(self) -> None:
+        now = datetime(2026, 4, 19, tzinfo=timezone.utc)
+        removed = make_result(
+            status="removed-remote",
+            message="No longer on Hugging Face: weights (upstream removed these files).",
+        )
+        removed.suggestions = ["model-Q4_0.gguf", "model-Q8_0.gguf"]
+        state = apply_results({}, [removed], now_utc=now)
+
+        alert = state["alerts"]["test-model"]
+        self.assertEqual(alert["check_status"], "removed-remote")
+        self.assertEqual(alert["suggestions"], ["model-Q4_0.gguf", "model-Q8_0.gguf"])
+        # It is still an actionable alert (pending acknowledgement) so the user
+        # is made aware, but it must never be offered as a downloadable update.
+        self.assertEqual(alert["status"], "pending")
+        self.assertEqual(state["last_summary"]["removed_remote"], 1)
+        self.assertEqual(state["last_summary"]["update_available"], 0)
+
+    def test_removed_remote_does_not_offer_update_in_plan(self) -> None:
+        # The alert vocabulary the UI filters on must match what the updater
+        # refuses to plan: a removed-remote alert is never a downloadable update.
+        now = datetime(2026, 4, 19, tzinfo=timezone.utc)
+        removed = make_result(
+            status="removed-remote",
+            message="No longer on Hugging Face: weights (upstream removed these files).",
+        )
+        removed.artifacts = [
+            ArtifactResult(
+                kind="weight",
+                label="weights",
+                status="removed-remote",
+                local_path=None,
+                remote_file="test.gguf",
+                local_size=None,
+                remote_size=None,
+                local_oid=None,
+                remote_oid=None,
+                last_commit_title=None,
+                last_commit_date_utc=None,
+                message="removed from Hugging Face",
+            )
+        ]
+        state = apply_results({}, [removed], now_utc=now)
+        alert = state["alerts"]["test-model"]
+        self.assertEqual(alert["check_status"], "removed-remote")
+        with TemporaryDirectory() as tmpdir:
+            with self.assertRaises(PlanError) as ctx:
+                build_update_plan([alert], models_root=Path(tmpdir))
+        self.assertIn("removed remote artifact", str(ctx.exception))
 
 
 class ReminderTests(unittest.TestCase):

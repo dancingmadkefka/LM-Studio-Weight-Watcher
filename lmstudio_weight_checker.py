@@ -24,6 +24,90 @@ HF_API_ROOT = "https://huggingface.co/api/models"
 SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
 
 
+def _is_quant_token(token: str) -> bool:
+    """True if a dash-delimited filename token looks like a quantization tag."""
+    u = token.upper()
+    if u in {"BF16", "F16", "FP16", "FP32", "F32", "MXFP4", "NVFP4"}:
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:IQ|TQ|Q)\d+(?:_[A-Z0-9]+)*",
+            token,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _quant_family(basename: str) -> tuple[str | None, str | None]:
+    """Return (model_family_key, quant_token) for a GGUF basename.
+
+    The family key is the name with its trailing quantization token removed, so
+    alternative quants (Q4_0, Q8_0, ...) of the same base model share a family
+    key. Returns (None, None) when no quant token is recognized.
+
+    Only the final dash-token is considered a quant. This avoids misparsing
+    names where a quant-like token (e.g. "F16") is part of the model name
+    rather than a trailing quantization tag (e.g. "F16-7B").
+    """
+    name = basename
+    if name.lower().endswith(".gguf"):
+        name = name[:-5]
+    name = re.sub(r"-\d{5}-of-\d{5}$", "", name)
+    if not name:
+        return (None, None)
+    tokens = name.split("-")
+    if not tokens:
+        return (None, None)
+    last = tokens[-1]
+    if _is_quant_token(last):
+        family = "-".join(tokens[:-1])
+        return (family or None, last)
+    return (None, None)
+
+
+def find_weight_alternatives(
+    repo: str,
+    remote_file: str,
+    tree_cache: dict[tuple[str, str], dict[str, Any]],
+) -> list[str]:
+    """Suggest other published quants of the same model when one is removed.
+
+    Scans the already-fetched Hugging Face tree cache for GGUF weights in the
+    same repo that share the removed file's model family but use a different
+    quant. This lets the UI tell the user what upstream still offers instead of
+    the deleted file, so a removed-remote alert is informative rather than a
+    dead-end that only offers a doomed "update".
+    """
+    basename = remote_file.rsplit("/", 1)[-1]
+    if not basename.lower().endswith(".gguf") or is_projector_filename(basename):
+        return []
+    family, quant = _quant_family(basename)
+    if not family or not quant:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for (cached_repo, _parent), entries in tree_cache.items():
+        if cached_repo != repo or not isinstance(entries, dict):
+            continue
+        for path, item in entries.items():
+            if not isinstance(item, dict) or item.get("type") != "file":
+                continue
+            name = path.rsplit("/", 1)[-1]
+            if (
+                not name.lower().endswith(".gguf")
+                or is_projector_filename(name)
+                or name == basename
+            ):
+                continue
+            other_family, other_quant = _quant_family(name)
+            if other_family == family and other_quant and other_quant != quant:
+                if name not in seen:
+                    seen.add(name)
+                    found.append(name)
+    found.sort()
+    return found[:12]
+
+
 @dataclass
 class RemoteReference:
     repo: str
@@ -62,6 +146,7 @@ class ArtifactResult:
     last_commit_title: str | None
     last_commit_date_utc: str | None
     message: str
+    suggestions: list[str] | None = None
 
 
 @dataclass
@@ -82,6 +167,7 @@ class CheckResult:
     hash_method: str | None = None
     last_commit_title: str | None = None
     artifacts: list = field(default_factory=list)
+    suggestions: list[str] | None = None
 
 
 class CheckerError(RuntimeError):
@@ -685,7 +771,8 @@ def compare_artifact(
     remote_oid: str | None = None
 
     def result(status: str, *, local_size: int | None, local_oid: str | None,
-              local_path: str | None, message: str) -> ArtifactResult:
+              local_path: str | None, message: str,
+              suggestions: list[str] | None = None) -> ArtifactResult:
         return ArtifactResult(
             kind=artifact.kind,
             label=artifact.label,
@@ -699,6 +786,7 @@ def compare_artifact(
             last_commit_title=last_commit_title,
             last_commit_date_utc=last_commit_date,
             message=message,
+            suggestions=suggestions,
         )
 
     local_exists = artifact.local_path.is_file()
@@ -738,6 +826,11 @@ def compare_artifact(
         remote_oid = lfs.get("oid") if isinstance(lfs, dict) else None
 
     if remote is None:
+        suggestions = (
+            find_weight_alternatives(artifact.remote_repo, artifact.remote_file, tree_cache)
+            if artifact.kind == "weight" and tree_cache is not None
+            else None
+        )
         if artifact.local_path.is_file():
             return result(
                 "removed-remote",
@@ -748,6 +841,7 @@ def compare_artifact(
                     f"{artifact.label}: removed from Hugging Face "
                     "(a local copy is still on disk)."
                 ),
+                suggestions=suggestions,
             )
         return result(
             "removed-remote",
@@ -757,6 +851,7 @@ def compare_artifact(
             message=(
                 f"{artifact.label}: no longer on Hugging Face and not present locally."
             ),
+            suggestions=suggestions,
         )
 
     if not artifact.local_path.is_file():
@@ -849,7 +944,7 @@ def rollup_model_status(
     removed = [r.label for r in artifact_results if r.status == "removed-remote"]
     if removed:
         return (
-            "update-available",
+            "removed-remote",
             "No longer on Hugging Face: " + ", ".join(removed)
             + " (upstream removed these files).",
         )
@@ -916,6 +1011,17 @@ def build_model_result(
         primary_result,
     )
 
+    all_suggestions: list[str] = []
+    seen_suggestions: set[str] = set()
+    for artifact in artifact_results:
+        if not artifact.suggestions:
+            continue
+        for suggestion in artifact.suggestions:
+            if suggestion not in seen_suggestions:
+                seen_suggestions.add(suggestion)
+                all_suggestions.append(suggestion)
+    suggestions = all_suggestions if all_suggestions else None
+
     return CheckResult(
         model_key=require_string(entry, "modelKey"),
         display_name=require_string(entry, "displayName"),
@@ -933,6 +1039,7 @@ def build_model_result(
         hash_method="lfs-oid",
         last_commit_title=(headline.last_commit_title if headline else None),
         artifacts=artifact_results,
+        suggestions=suggestions,
     )
 
 
@@ -1088,6 +1195,7 @@ def require_string(payload: dict[str, Any], key: str) -> str:
 def summarize_results(results: list[CheckResult]) -> dict[str, int]:
     summary = {
         "update-available": 0,
+        "removed-remote": 0,
         "up-to-date": 0,
         "unresolved": 0,
     }
@@ -1100,6 +1208,7 @@ def summarize_results(results: list[CheckResult]) -> dict[str, int]:
 def status_sort_key(status: str) -> int:
     return {
         "update-available": 0,
+        "removed-remote": 0,
         "unresolved": 1,
         "up-to-date": 2,
     }.get(status, 9)
@@ -1121,7 +1230,7 @@ def print_human_report(
     visible = [
         result
         for result in results
-        if show_all or result.status in {"update-available", "unresolved"}
+        if show_all or result.status in {"update-available", "removed-remote", "unresolved"}
     ]
     if not visible:
         print("No updates detected.")
@@ -1142,6 +1251,8 @@ def print_human_report(
             print(f"  last commit:     {result.last_commit_title}")
         if result.message:
             print(f"  note:            {result.message}")
+        if result.suggestions:
+            print(f"  upstream still offers (for removed file): {', '.join(result.suggestions)}")
         for art in result.artifacts:
             print(
                 f"    - [{art.status}] {art.label}  "

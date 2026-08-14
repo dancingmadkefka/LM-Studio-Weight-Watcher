@@ -81,6 +81,7 @@ COLOR_DETAIL_BORDER = "#c8dff8"
 ROW_PENDING_BG = "#fff5f5"  
 ROW_SNOOZED_BG = "#f7f4ff"  
 ROW_OK_BG = "#ffffff"  
+ROW_REMOVED_BG = "#fff8e6"
   
   
 @dataclass  
@@ -503,14 +504,28 @@ class WatcherApp:
         self.maybe_raise_pending_window(force=False)
 
     def update_selected(self) -> None:
-        self.prepare_update_async(self.selected_model_keys())
+        keys = [
+            k
+            for k in self.selected_model_keys()
+            if self._alerts_by_key.get(k, {}).get("check_status") == "update-available"
+        ]
+        if not keys:
+            self.status_var.set(
+                "Selected model(s) have no downloadable update (e.g. removed upstream)."
+            )
+            return
+        self.prepare_update_async(keys)
 
     def update_all_pending(self) -> None:
         keys = [
             alert.get("model_key")
             for alert in pending_alerts(self.state, datetime.now(timezone.utc))
             if alert.get("model_key")
+            and alert.get("check_status") == "update-available"
         ]
+        if not keys:
+            self.status_var.set("No downloadable updates are pending.")
+            return
         self.prepare_update_async(keys)
 
     def prepare_update_async(self, model_keys: list[str]) -> None:
@@ -1058,6 +1073,7 @@ class WatcherApp:
         self.tree.tag_configure("pending", background=ROW_PENDING_BG, foreground=COLOR_TEXT)  
         self.tree.tag_configure("snoozed", background=ROW_SNOOZED_BG, foreground=COLOR_TEXT)  
         self.tree.tag_configure("acknowledged", background=ROW_OK_BG, foreground=COLOR_MUTED)  
+        self.tree.tag_configure("removed", background=ROW_REMOVED_BG, foreground=COLOR_WARN)
         self.tree.tag_configure("empty", foreground=COLOR_MUTED)  
   
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)  
@@ -1258,12 +1274,25 @@ class WatcherApp:
 
     def _refresh_action_states(self) -> None:
         busy = self.recovery_in_progress or self.check_in_progress or self.update_in_progress
-        selected = bool(self.selected_model_keys())
-        pending = bool(pending_alerts(self.state, datetime.now(timezone.utc)))
+        now_utc = datetime.now(timezone.utc)
+        pending_alerts_list = pending_alerts(self.state, now_utc)
+        pending = bool(pending_alerts_list)
+        selected_keys = self.selected_model_keys()
+        selected = bool(selected_keys)
+        # An update can only be offered for models whose source still exists
+        # upstream. A removed-remote model has nothing to download, so offering
+        # "Update" would just fail (or, worse, imply the local copy is replaceable).
+        selected_updatable = any(
+            self._alerts_by_key.get(k, {}).get("check_status") == "update-available"
+            for k in selected_keys
+        )
+        pending_updatable = any(
+            a.get("check_status") == "update-available" for a in pending_alerts_list
+        )
         controls = (
             ("check_button", not busy),
-            ("update_selected_button", selected and not busy),
-            ("update_all_button", pending and not busy),
+            ("update_selected_button", selected and selected_updatable and not busy),
+            ("update_all_button", pending and pending_updatable and not busy),
             (
                 "cancel_update_button",
                 self.update_in_progress
@@ -1312,6 +1341,20 @@ class WatcherApp:
                 if ct:
                     line += f"  (commit: {ct})"
                 text.insert(tk.END, line + "\n")
+
+        if alert.get("check_status") == "removed-remote":
+            text.insert(tk.END, "\n", "muted")
+            text.insert(
+                tk.END,
+                "This exact file was deleted upstream. Your local copy is preserved, "
+                "so updating is not offered — there is nothing to download. Keep your "
+                "copy, or switch to a quant still published in the repository below.\n",
+            )
+            suggestions = alert.get("suggestions") or []
+            if suggestions:
+                text.insert(tk.END, "Upstream still offers these quants:\n", "name")
+                for s in suggestions:
+                    text.insert(tk.END, f"  • {s}\n")
 
         repo = alert.get("remote_repo")
         if repo:
@@ -1394,13 +1437,22 @@ class WatcherApp:
                 delta_text = humanize_delta(delta) if delta is not None else "—"  
                 remote_mod = alert.get("remote_modified_utc")  
                 remote_display = format_iso_friendly(remote_mod) if remote_mod else "—"  
-                tag = status_raw if status_raw in ("pending", "snoozed", "acknowledged") else "pending"  
-  
+                removed_upstream = alert.get("check_status") == "removed-remote"
+                # A snoozed/acknowledged removed model keeps that styling (and its
+                # ⊘ marker) so it never masquerades as an updatable model.
+                if removed_upstream and status_raw not in ("snoozed", "acknowledged"):
+                    tag = "removed"
+                elif status_raw in ("pending", "snoozed", "acknowledged"):
+                    tag = status_raw
+                else:
+                    tag = "pending"
+
                 name = alert.get("display_name") or alert["model_key"]  
                 uploader, repo_tail = split_remote_repo(alert.get("remote_repo"))  
                 remote_file = remote_file_basename(alert.get("remote_file"))  
-                # Prefix bullet only for pending  
-                prefix = "● " if tag == "pending" else ""  
+                # Prefix bullet for pending; removed-upstream keeps its distinct
+                # marker on every row so it can't be mistaken for an update.  
+                prefix = "● " if tag == "pending" else ("⊘ " if removed_upstream else "")  
   
                 self.tree.insert(  
                     "",  
@@ -1426,6 +1478,16 @@ class WatcherApp:
         update_status = self.update_model_status.get(alert.get("model_key"))
         if update_status:
             return update_status
+        check_status = alert.get("check_status")
+        if check_status == "removed-remote":
+            if status_raw == "snoozed":
+                until = alert.get("snoozed_until_utc")
+                if until:
+                    return f"Removed upstream · snoozed until {format_iso_friendly(until)}"
+                return "Removed upstream · snoozed"
+            if status_raw == "acknowledged":
+                return "Removed upstream · acknowledged"
+            return "Removed upstream"
         if status_raw == "pending":  
             return "Update available"  
         if status_raw == "snoozed":  
@@ -1490,6 +1552,12 @@ class WatcherApp:
         alerts = list(all_alerts(self.state, now_utc))  
         pending_count = sum(1 for a in alerts if a.get("status") == "pending")  
         snoozed_count = sum(1 for a in alerts if a.get("status") == "snoozed")  
+        removed_count = sum(
+            1
+            for a in alerts
+            if a.get("status") == "pending" and a.get("check_status") == "removed-remote"
+        )
+        updatable_count = pending_count - removed_count
   
         summary = self.state.get("last_summary", {})  
         unresolved_count = summary.get("unresolved", len(self.state.get("unresolved", [])))  
@@ -1506,8 +1574,16 @@ class WatcherApp:
         elif self.check_in_progress:
             self.headline_var.set("Checking for updates...")  
         elif pending_count > 0:  
-            noun = "update" if pending_count == 1 else "updates"  
-            self.headline_var.set(f"{pending_count} model {noun} available")  
+            if removed_count and not updatable_count:
+                noun = "model" if removed_count == 1 else "models"
+                self.headline_var.set(f"{removed_count} {noun} removed upstream")
+            elif removed_count and updatable_count:
+                self.headline_var.set(
+                    f"{updatable_count} update(s) · {removed_count} removed upstream"
+                )
+            else:
+                noun = "update" if updatable_count == 1 else "updates"
+                self.headline_var.set(f"{updatable_count} model {noun} available")  
         elif snoozed_count > 0:  
             self.headline_var.set("All caught up · snoozed items remain")  
         elif unresolved_count > 0 or self.state.get("last_error"):  

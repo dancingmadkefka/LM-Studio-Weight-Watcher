@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import tkinter as tk
 import threading
 import unittest
@@ -338,6 +339,135 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.tree.selection.return_value = ("model", "I001")
         app._alerts_by_key = {"model": {"model_key": "model"}}
         self.assertEqual(app.selected_model_keys(), ["model"])
+
+    def test_update_selected_filters_removed_remote(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ("updatable", "removed")
+        app._alerts_by_key = {
+            "updatable": {"model_key": "updatable", "check_status": "update-available"},
+            "removed": {"model_key": "removed", "check_status": "removed-remote"},
+        }
+        app.prepare_update_async = Mock()
+        app.update_selected()
+        app.prepare_update_async.assert_called_once_with(["updatable"])
+
+    def test_update_selected_no_updatable_shows_status(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ("removed",)
+        app._alerts_by_key = {
+            "removed": {"model_key": "removed", "check_status": "removed-remote"},
+        }
+        app.prepare_update_async = Mock()
+        app.update_selected()
+        app.prepare_update_async.assert_not_called()
+        app.status_var.set.assert_called_once()
+
+    def test_update_all_pending_filters_removed_remote(self) -> None:
+        app = self.make_app()
+        app.state["alerts"] = {
+            "updatable": {
+                "model_key": "updatable",
+                "status": "pending",
+                "check_status": "update-available",
+            },
+            "removed": {
+                "model_key": "removed",
+                "status": "pending",
+                "check_status": "removed-remote",
+            },
+        }
+        app.prepare_update_async = Mock()
+        app.update_all_pending()
+        app.prepare_update_async.assert_called_once_with(["updatable"])
+
+    def test_update_all_pending_no_updatable_shows_status(self) -> None:
+        app = self.make_app()
+        app.state["alerts"] = {
+            "removed": {
+                "model_key": "removed",
+                "status": "pending",
+                "check_status": "removed-remote",
+            },
+        }
+        app.prepare_update_async = Mock()
+        app.update_all_pending()
+        app.prepare_update_async.assert_not_called()
+        app.status_var.set.assert_called_once()
+
+    def test_refresh_action_states_disables_update_for_removed_only(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ("removed",)
+        app._alerts_by_key = {
+            "removed": {"model_key": "removed", "check_status": "removed-remote"},
+        }
+        app.state["alerts"] = {
+            "removed": {
+                "model_key": "removed",
+                "status": "pending",
+                "check_status": "removed-remote",
+            },
+        }
+        app.check_button = Mock()
+        app.update_selected_button = Mock()
+        app.update_all_button = Mock()
+        app.cancel_update_button = Mock()
+        app._refresh_action_states()
+        app.update_selected_button.configure.assert_called_once_with(state=tk.DISABLED)
+        app.update_all_button.configure.assert_called_once_with(state=tk.DISABLED)
+        app.check_button.configure.assert_called_once_with(state=tk.NORMAL)
+
+    def test_refresh_action_states_enables_update_for_updatable(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ("updatable",)
+        app._alerts_by_key = {
+            "updatable": {"model_key": "updatable", "check_status": "update-available"},
+        }
+        app.state["alerts"] = {
+            "updatable": {
+                "model_key": "updatable",
+                "status": "pending",
+                "check_status": "update-available",
+            },
+        }
+        app.check_button = Mock()
+        app.update_selected_button = Mock()
+        app.update_all_button = Mock()
+        app.cancel_update_button = Mock()
+        app._refresh_action_states()
+        app.update_selected_button.configure.assert_called_once_with(state=tk.NORMAL)
+        app.update_all_button.configure.assert_called_once_with(state=tk.NORMAL)
+        app.check_button.configure.assert_called_once_with(state=tk.NORMAL)
+
+    def test_format_status_removed_remote_pending(self) -> None:
+        app = self.make_app()
+        alert = {"model_key": "removed", "check_status": "removed-remote"}
+        self.assertEqual(
+            app._format_status(alert, "pending", datetime.now(timezone.utc)),
+            "Removed upstream",
+        )
+
+    def test_format_status_removed_remote_keeps_snooze_and_ack(self) -> None:
+        # A removed-upstream model that was snoozed or acknowledged must say so;
+        # otherwise it silently re-appears as a fresh warning forever.
+        app = self.make_app()
+        alert = {
+            "model_key": "removed",
+            "check_status": "removed-remote",
+            "snoozed_until_utc": "2026-04-19T12:00:00Z",
+        }
+        self.assertTrue(
+            app._format_status(alert, "snoozed", datetime.now(timezone.utc)).startswith(
+                "Removed upstream · snoozed"
+            )
+        )
+        self.assertEqual(
+            app._format_status(alert, "acknowledged", datetime.now(timezone.utc)),
+            "Removed upstream · acknowledged",
+        )
 
     def test_quit_defers_while_install_is_non_cancellable(self) -> None:
         app = self.make_app()

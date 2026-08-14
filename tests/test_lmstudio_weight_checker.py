@@ -11,9 +11,11 @@ from lmstudio_weight_checker import (
     Artifact,
     CheckerError,
     RemoteFileMissing,
+    _quant_family,
     build_variant_lookup,
     candidate_references,
     compare_artifact,
+    find_weight_alternatives,
     is_projector_filename,
     parse_remote_reference,
     prune_hash_cache,
@@ -310,6 +312,34 @@ class CompareArtifactTests(unittest.TestCase):
 
         self.assertEqual(result.status, "removed-remote")
 
+    def test_removed_weight_suggests_same_family_quants(self) -> None:
+        # When the exact quant is deleted upstream but the repo still publishes
+        # sibling quants of the same base model, surface those so the user knows
+        # what to switch to instead of being offered a doomed download.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = Path(tmpdir) / "Test-Model-Q4_K_M.gguf"
+            f.write_bytes(b"local-only")
+            tree = {
+                (self.REPO, ""): {
+                    "Test-Model-BF16.gguf": remote_entry(oid="b" * 64, size=10),
+                    "Test-Model-Q4_0.gguf": remote_entry(oid="c" * 64, size=10),
+                    "Test-Model-Q8_0.gguf": remote_entry(oid="d" * 64, size=10),
+                    "mmproj-F32.gguf": remote_entry(oid="e" * 64, size=10),
+                    "OtherModel-Q4_0.gguf": remote_entry(oid="f" * 64, size=10),
+                }
+            }
+
+            result = compare_artifact(
+                self._artifact(f, remote_file="Test-Model-Q4_K_M.gguf"),
+                timeout_seconds=5, tree_cache=tree, hash_cache={},
+            )
+
+        self.assertEqual(result.status, "removed-remote")
+        self.assertEqual(
+            result.suggestions,
+            ["Test-Model-BF16.gguf", "Test-Model-Q4_0.gguf", "Test-Model-Q8_0.gguf"],
+        )
+
     def test_local_shard_missing_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             missing = Path(tmpdir) / "does-not-exist.gguf"
@@ -367,12 +397,22 @@ class RollupModelStatusTests(unittest.TestCase):
         status, _ = rollup_model_status([self._art("missing-local", label="weights (shard 2/2)")])
         self.assertEqual(status, "unresolved")
 
-    def test_removed_remote_maps_to_actionable_alert(self) -> None:
+    def test_removed_remote_is_its_own_model_status(self) -> None:
         status, message = rollup_model_status([self._art("removed-remote", label="weights")])
-        # Model-level status stays in the alert vocab this turn; detail is in
-        # the message and the per-artifact results.
-        self.assertEqual(status, "update-available")
+        # A removed-remote file is tracked distinctly from a genuine weight
+        # update: the UI shows "Removed upstream" and does not offer to
+        # download (there is nothing to fetch), so it must not collapse into
+        # "update-available".
+        self.assertEqual(status, "removed-remote")
         self.assertIn("Hugging Face", message)
+
+    def test_removed_remote_outranks_update_available(self) -> None:
+        # If one artifact is removed upstream and another has new weights, the
+        # removed-remote verdict wins so we never offer a partial, doomed update.
+        status, _ = rollup_model_status(
+            [self._art("removed-remote", label="weights"), self._art("update-available", label="projector")]
+        )
+        self.assertEqual(status, "removed-remote")
 
     def test_projector_missing_local_alone_does_not_break_model(self) -> None:
         # A projector is optional; even if one were reported missing-local it
@@ -639,6 +679,44 @@ class LocalOidCacheTests(unittest.TestCase):
 
         self.assertEqual(oid_first, hashlib.sha256(b"abc").hexdigest())
         self.assertEqual(oid_second, "deadbeef")
+
+
+class QuantFamilyTests(unittest.TestCase):
+    def test_family_strips_trailing_quant_token(self) -> None:
+        # The trailing quantization token is stripped; a leading "UD" imatrix
+        # marker is a separate dash-token and stays part of the family key, so
+        # UD-Q4_K_XL and UD-Q8_K_XL still share a family.
+        self.assertEqual(_quant_family("Qwen3.5-9B-UD-Q4_K_XL.gguf"), ("Qwen3.5-9B-UD", "Q4_K_XL"))
+        self.assertEqual(_quant_family("Model-Q4_0.gguf"), ("Model", "Q4_0"))
+        self.assertEqual(_quant_family("Model-Q8_0.gguf"), ("Model", "Q8_0"))
+        self.assertEqual(_quant_family("Model-BF16.gguf"), ("Model", "BF16"))
+
+    def test_sharded_name_keeps_family(self) -> None:
+        self.assertEqual(
+            _quant_family("Big-Q4_K-00001-of-00002.gguf"),
+            ("Big", "Q4_K"),
+        )
+
+    def test_trie_quant_tokens_are_recognized(self) -> None:
+        self.assertEqual(_quant_family("Model-TQ1_0.gguf"), ("Model", "TQ1_0"))
+        self.assertEqual(_quant_family("Model-IQ2_XXS.gguf"), ("Model", "IQ2_XXS"))
+
+    def test_non_quant_name_has_no_family(self) -> None:
+        self.assertEqual(_quant_family("README.md"), (None, None))
+
+    def test_find_weight_alternatives_excludes_projectors_and_other_models(self) -> None:
+        tree_cache = {
+            ("org/repo", ""): {
+                "Model-BF16.gguf": {"type": "file"},
+                "Model-Q4_0.gguf": {"type": "file"},
+                "mmproj-F32.gguf": {"type": "file"},
+                "Other-Q4_0.gguf": {"type": "file"},
+            }
+        }
+        self.assertEqual(
+            find_weight_alternatives("org/repo", "Model-Q4_K_M.gguf", tree_cache),
+            ["Model-BF16.gguf", "Model-Q4_0.gguf"],
+        )
 
 
 if __name__ == "__main__":

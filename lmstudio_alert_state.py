@@ -26,6 +26,7 @@ ALERT_STRING_FIELDS = (
     "remote_sha256",
     "hash_method",
     "last_commit_title",
+    "check_status",
     "fingerprint",
     "first_detected_utc",
     "last_detected_utc",
@@ -60,6 +61,7 @@ def blank_state() -> dict[str, Any]:
         "last_summary": {
             "checked": 0,
             "update_available": 0,
+            "removed_remote": 0,
             "up_to_date": 0,
             "unresolved": 0,
         },
@@ -114,8 +116,19 @@ def _sanitize_alert(key: object, value: dict[str, Any]) -> dict[str, Any]:
                 field_value = artifact.get(field)
                 if isinstance(field_value, bool) or not isinstance(field_value, int):
                     artifact[field] = None
+            sugg = artifact.get("suggestions")
+            if isinstance(sugg, list):
+                artifact["suggestions"] = [s for s in sugg if isinstance(s, str)][:24]
+            else:
+                artifact["suggestions"] = []
             clean_artifacts.append(artifact)
     alert["artifacts"] = clean_artifacts
+
+    suggestions = alert.get("suggestions")
+    if isinstance(suggestions, list):
+        alert["suggestions"] = [s for s in suggestions if isinstance(s, str)][:24]
+    else:
+        alert["suggestions"] = []
     return alert
 
 
@@ -252,7 +265,7 @@ def apply_results(
     active_alert_keys: set[str] = set()
 
     for result in results:
-        if result.status == "update-available":
+        if result.status in {"update-available", "removed-remote"}:
             active_alert_keys.add(result.model_key)
             fingerprint = fingerprint_for_result(result)
             current = alerts.get(result.model_key)
@@ -302,6 +315,7 @@ def apply_results(
     next_state["last_summary"] = {
         "checked": len(results),
         "update_available": sum(result.status == "update-available" for result in results),
+        "removed_remote": sum(result.status == "removed-remote" for result in results),
         "up_to_date": sum(result.status == "up-to-date" for result in results),
         "unresolved": sum(result.status == "unresolved" for result in results),
     }
@@ -330,6 +344,8 @@ def alert_payload(
         "remote_sha256": getattr(result, "remote_sha256", None),
         "hash_method": getattr(result, "hash_method", None),
         "last_commit_title": getattr(result, "last_commit_title", None),
+        "check_status": getattr(result, "status", None),
+        "suggestions": getattr(result, "suggestions", None),
         "artifacts": [asdict(a) for a in getattr(result, "artifacts", [])],
         "fingerprint": fingerprint_for_result(result),
         "first_detected_utc": first_detected_utc or format_utc(now_utc),

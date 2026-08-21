@@ -170,6 +170,13 @@ class WatcherLifecycleTests(unittest.TestCase):
             safety_reserve_bytes=256,
         )
 
+    def stub_create_window(self, app: WatcherApp) -> Mock:
+        """Install a fake create_window that assigns a Mock Toplevel."""
+        window = Mock()
+        window.winfo_exists.return_value = True
+        app.create_window = Mock(side_effect=lambda: setattr(app, "window", window))
+        return window
+
     def test_check_does_not_start_while_update_is_active(self) -> None:
         app = self.make_app()
         app.update_in_progress = True
@@ -209,6 +216,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.update_in_progress = True
         app.update_cancellation = CancellationToken()
         app.update_model_status = {"model": "Queued"}
+        self.stub_create_window(app)
         with (
             patch("lmstudio_weight_watcher.messagebox.askyesno", return_value=False),
             patch("lmstudio_weight_watcher.threading.Thread") as thread,
@@ -224,6 +232,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.update_in_progress = True
         app.update_cancellation = CancellationToken()
         app.update_model_status = {"model": "Queued"}
+        self.stub_create_window(app)
         worker = Mock()
         with (
             patch("lmstudio_weight_watcher.messagebox.askyesno", return_value=True),
@@ -243,6 +252,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.update_in_progress = True
         app.update_cancellation = CancellationToken()
         app.update_model_status = {"model": "Queued"}
+        self.stub_create_window(app)
         with patch(
             "lmstudio_weight_watcher.messagebox.askyesno",
             side_effect=tk.TclError("window destroyed"),
@@ -251,6 +261,33 @@ class WatcherLifecycleTests(unittest.TestCase):
         self.assertFalse(app.update_in_progress)
         self.assertIsNone(app.active_update_plan)
         app.status_var.set.assert_called_once()
+
+    def test_tray_path_confirmation_creates_real_parent_window(self) -> None:
+        # Update All from the tray menu runs with no window open. The
+        # confirmation dialog must still get a real parent: the app must
+        # create its window first rather than ask parentless over the
+        # withdrawn root.
+        app = self.make_app()
+        app.update_in_progress = True
+        app.update_cancellation = CancellationToken()
+        app.update_model_status = {"model": "Queued"}
+        window = self.stub_create_window(app)
+        with (
+            patch(
+                "lmstudio_weight_watcher.messagebox.askyesno", return_value=False
+            ) as askyesno,
+            patch("lmstudio_weight_watcher.threading.Thread") as thread,
+        ):
+            app.finish_prepare_update(self.make_plan(), None)
+        app.create_window.assert_called_once()
+        parent = askyesno.call_args.kwargs["parent"]
+        self.assertIsNotNone(parent)
+        self.assertIs(parent, window)
+        # No forbidden focus-steal API on the freshly created window.
+        window.focus_force.assert_not_called()
+        window.attributes.assert_not_called()
+        window.lift.assert_not_called()
+        thread.assert_not_called()
 
     def test_progress_callback_is_marshalled_to_tk_thread(self) -> None:
         app = self.make_app()

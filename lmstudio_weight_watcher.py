@@ -624,10 +624,17 @@ class WatcherApp:
             details.extend(["", "Upstream changes:"])
             details.extend(f"• {title}" for title in commit_titles)
         try:
+            if self.window is None or not self.window.winfo_exists():
+                # Tray path (Update All from the tray menu) with no window
+                # open: build one so the confirmation dialog is parented to
+                # a real window instead of floating parentless over the
+                # withdrawn root. The new window maps by normal WM rules
+                # only — the user just acted, so showing it is expected.
+                self.create_window()
             confirmed = messagebox.askyesno(
                 "Confirm model update",
                 "\n".join(details),
-                parent=self.window if self.window and self.window.winfo_exists() else None,
+                parent=self.window,
             )
         except tk.TclError as exc:
             self.update_in_progress = False

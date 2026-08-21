@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import tkinter as tk
 import threading
 import unittest
@@ -98,7 +98,6 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.last_progress_post_phase = None
         app.quit_after_update = False
         app.next_check_token = None
-        app.topmost_reset_token = None
         app.window = None
         app.root = Mock()
         app.icon = Mock()
@@ -110,6 +109,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.refresh_ui = Mock()
         app.schedule_next_check = Mock()
         app.maybe_raise_pending_window = Mock()
+        app.toaster = Mock()
         return app
 
     def test_startup_recovery_runs_in_background(self) -> None:
@@ -554,30 +554,97 @@ class WatcherLifecycleTests(unittest.TestCase):
         )
         app.root.after.assert_called_once()
 
-    def test_clear_topmost_exits_cleanly_when_window_is_gone(self) -> None:
+    def test_show_window_never_focus_forces_or_topmosts(self) -> None:
         app = self.make_app()
-        app.topmost_reset_token = "token-1"
         app.window = Mock()
-        app.window.winfo_exists.return_value = False
+        app.window.winfo_exists.return_value = True
+        app.refresh_tree = Mock()
 
-        app._clear_topmost()
+        app.show_window()
 
-        self.assertIsNone(app.topmost_reset_token)
+        app.window.deiconify.assert_called_once()
+        app.window.lift.assert_called_once()
         app.window.attributes.assert_not_called()
+        app.window.focus_force.assert_not_called()
+
+    def test_maybe_raise_pending_window_toasts_instead_of_raising(self) -> None:
+        app = self.make_app()
+        app.maybe_raise_pending_window = WatcherApp.maybe_raise_pending_window.__get__(
+            app
+        )
+        app.reminder_interval = timedelta(minutes=60)
+        app.state = {
+            "alerts": {
+                "m1": {
+                    "model_key": "m1",
+                    "display_name": "Model One",
+                    "status": "pending",
+                    "check_status": "update-available",
+                }
+            },
+            "active_update": None,
+        }
+        with (
+            patch("lmstudio_weight_watcher.reminder_due", return_value=True),
+            patch("lmstudio_weight_watcher.record_reminder") as record_reminder,
+            patch("lmstudio_weight_watcher.save_state") as save_state,
+            patch.object(WatcherApp, "show_window") as show_window,
+        ):
+            app.maybe_raise_pending_window(force=False)
+
+        self.assertEqual(app.toaster.notify.call_count, 1)
+        alert_key = app.toaster.notify.call_args.args[0]
+        self.assertEqual(alert_key, (("m1", "update-available"),))
+        body = app.toaster.notify.call_args.args[1]
+        self.assertIn("Model One", body)
+        self.assertIn("update", body)
+        show_window.assert_not_called()
+        app.root.bell.assert_not_called()
+        record_reminder.assert_called_once()
+        save_state.assert_called_once()
+
+    def test_maybe_raise_pending_window_dedupes_unchanged_state(self) -> None:
+        app = self.make_app()
+        app.maybe_raise_pending_window = WatcherApp.maybe_raise_pending_window.__get__(
+            app
+        )
+        app.reminder_interval = timedelta(minutes=60)
+        app.state = {
+            "alerts": {
+                "m1": {
+                    "model_key": "m1",
+                    "display_name": "Model One",
+                    "status": "pending",
+                    "check_status": "update-available",
+                }
+            },
+            "active_update": None,
+        }
+        with (
+            patch("lmstudio_weight_watcher.reminder_due", return_value=True),
+            patch(
+                "lmstudio_weight_watcher.record_reminder",
+                side_effect=lambda state, now_utc: state,
+            ),
+            patch("lmstudio_weight_watcher.save_state"),
+        ):
+            app.maybe_raise_pending_window(force=False)
+            app.maybe_raise_pending_window(force=False)
+
+        self.assertEqual(app.toaster.notify.call_count, 2)
+        first_key = app.toaster.notify.call_args_list[0].args[0]
+        second_key = app.toaster.notify.call_args_list[1].args[0]
+        self.assertEqual(first_key, second_key)
+        # Dedupe happens inside WatchToaster; identical keys mean no second toast.
 
     def test_quit_cancels_pending_timers(self) -> None:
         app = self.make_app()
         app.next_check_token = "check-token"
-        app.topmost_reset_token = "topmost-token"
-        app.window = Mock()
-        app.window.winfo_exists.return_value = True
 
         app.quit()
 
         self.assertTrue(app.shutting_down)
         self.assertIsNone(app.next_check_token)
-        self.assertIsNone(app.topmost_reset_token)
-        app.window.after_cancel.assert_called_once_with("topmost-token")
         app.root.after_cancel.assert_called_once_with("check-token")
         app.icon.stop.assert_called_once()
         app.root.quit.assert_called_once()

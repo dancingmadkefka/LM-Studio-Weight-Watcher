@@ -100,6 +100,77 @@ class FakeDownloader:
 
 
 class PlanTests(unittest.TestCase):
+    def _space_result(self, base: Path, *, old: bytes = b"o" * 100, new: bytes = b"n" * 100):
+        root = base / "models"
+        destination = root / "org" / "repo" / "model.gguf"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(old)
+        result = check_result(
+            key="model", name="Model", repo="org/repo",
+            artifacts=[artifact_result(destination=destination, remote_file="model.gguf", content=new)],
+        )
+        return root, result
+
+    def test_plan_requires_space_for_backup_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, result = self._space_result(Path(tmp))
+            for free in (150, 200, 299):
+                with self.subTest(available_bytes=free):
+                    with self.assertRaisesRegex(PlanError, "Insufficient disk space"):
+                        build_update_plan(
+                            [result], models_root=root, safety_reserve_bytes=0,
+                            available_bytes=free,
+                        )
+            plan = build_update_plan(
+                [result], models_root=root, safety_reserve_bytes=0,
+                available_bytes=300,
+            )
+            self.assertEqual(plan.required_bytes, 300)
+            self.assertEqual(plan.backup_bytes, 100)
+
+    def test_plan_space_error_names_backup_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, result = self._space_result(Path(tmp))
+            with self.assertRaises(PlanError) as raised:
+                build_update_plan([result], models_root=root, safety_reserve_bytes=0, available_bytes=150)
+            self.assertIn("download 100", str(raised.exception))
+            self.assertIn("backup 100", str(raised.exception))
+            self.assertIn("need 300", str(raised.exception))
+            self.assertIn("have 150", str(raised.exception))
+
+    def test_plan_rejects_cross_volume_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, result = self._space_result(Path(tmp))
+            with patch("lmstudio_weight_updater._volume_identity", side_effect=["destination", "staging"]):
+                with self.assertRaises(PlanError) as raised:
+                    build_update_plan([result], models_root=root, safety_reserve_bytes=0, available_bytes=1000)
+            self.assertIn(str(root), str(raised.exception))
+            self.assertIn(str(root.parent / ".weight-watcher-staging"), str(raised.exception))
+
+    def test_plan_accepts_same_volume_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, result = self._space_result(Path(tmp))
+            with patch("lmstudio_weight_updater._volume_identity", return_value="same") as identity:
+                plan = build_update_plan([result], models_root=root, safety_reserve_bytes=0, available_bytes=1000)
+            self.assertEqual(identity.call_count, 2)
+            self.assertEqual(plan.models_root, root)
+
+    def test_plan_reserve_covers_largest_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, result = self._space_result(Path(tmp), old=b"old", new=b"n" * 4096)
+            plan = build_update_plan([result], models_root=root, safety_reserve_bytes=1, available_bytes=8200)
+            self.assertEqual(plan.effective_reserve_bytes, 4096)
+            self.assertEqual(plan.required_bytes, 4096 + 3 + 4096)
+
+    def test_plan_summary_reports_both_volumes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, result = self._space_result(Path(tmp))
+            plan = build_update_plan([result], models_root=root, safety_reserve_bytes=0, available_bytes=1000)
+            summary = plan.summary_dict()
+            self.assertEqual(summary["destination_available_bytes"], 1000)
+            self.assertEqual(summary["staging_available_bytes"], 1000)
+            self.assertEqual(summary["backup_bytes"], 100)
+
     def test_plan_preserves_nested_file_and_stages_outside_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "models"

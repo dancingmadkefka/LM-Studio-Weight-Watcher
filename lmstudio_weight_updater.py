@@ -146,6 +146,11 @@ class UpdatePlan:
     remaining_download_bytes: int
     available_bytes: int
     safety_reserve_bytes: int
+    backup_bytes: int = 0
+    required_bytes: int = 0
+    effective_reserve_bytes: int = 0
+    destination_available_bytes: int = 0
+    staging_available_bytes: int = 0
 
     def summary_dict(self) -> dict[str, Any]:
         return {
@@ -158,6 +163,11 @@ class UpdatePlan:
             "remaining_download_bytes": self.remaining_download_bytes,
             "available_bytes": self.available_bytes,
             "safety_reserve_bytes": self.safety_reserve_bytes,
+            "backup_bytes": self.backup_bytes,
+            "required_bytes": self.required_bytes,
+            "effective_reserve_bytes": self.effective_reserve_bytes,
+            "destination_available_bytes": self.destination_available_bytes,
+            "staging_available_bytes": self.staging_available_bytes,
             "artifacts": [artifact.manifest_dict() for artifact in self.artifacts],
         }
 
@@ -299,6 +309,14 @@ def staging_root_for(models_root: Path) -> Path:
     return _safe_resolve(models_root).parent / STAGING_DIRECTORY_NAME
 
 
+def _volume_identity(path: Path) -> str | int:
+    """Identify the volume containing an existing path or its nearest parent."""
+    existing = _nearest_existing(path).resolve(strict=True)
+    if os.name == "nt":
+        return existing.drive.casefold()
+    return existing.stat().st_dev
+
+
 def build_update_plan(
     results: Sequence[CheckResult | dict[str, Any]],
     *,
@@ -418,6 +436,10 @@ def build_update_plan(
     )
     job_id = "job-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
     staging_root = staging_root_for(root)
+    if _volume_identity(root) != _volume_identity(staging_root):
+        raise PlanError(
+            f"Staging root {staging_root} is on a different volume from models root {root}."
+        )
     manifest_path = staging_root / "jobs" / f"{job_id}.json"
 
     planned: list[UpdateArtifact] = []
@@ -458,13 +480,22 @@ def build_update_plan(
             )
         )
 
+    backup_bytes = sum(
+        artifact.destination.stat().st_size
+        for artifact in planned
+        if artifact.destination.is_file()
+    )
     if available_bytes is None:
-        available_bytes = shutil.disk_usage(_nearest_existing(staging_root)).free
-    required = remaining + safety_reserve_bytes
+        available_bytes = shutil.disk_usage(_nearest_existing(root)).free
+    destination_available_bytes = available_bytes
+    staging_available_bytes = destination_available_bytes
+    effective_reserve = max(safety_reserve_bytes, max(a.expected_size for a in planned))
+    required = remaining + backup_bytes + effective_reserve
     if available_bytes < required:
         raise PlanError(
             "Insufficient disk space: "
-            f"need {required} bytes including reserve, have {available_bytes} bytes."
+            f"need {required} bytes (download {remaining}, backup {backup_bytes}, "
+            f"reserve {effective_reserve}), have {available_bytes} bytes."
         )
 
     return UpdatePlan(
@@ -479,6 +510,11 @@ def build_update_plan(
         remaining_download_bytes=remaining,
         available_bytes=available_bytes,
         safety_reserve_bytes=safety_reserve_bytes,
+        backup_bytes=backup_bytes,
+        required_bytes=required,
+        effective_reserve_bytes=effective_reserve,
+        destination_available_bytes=destination_available_bytes,
+        staging_available_bytes=staging_available_bytes,
     )
 
 

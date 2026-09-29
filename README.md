@@ -68,6 +68,11 @@ All three accept `--models-root`, `--state-file`, and `--timeout-seconds`.
    files are left in place and reported.
 5. Cleanup only deletes files the updater created.
 
+Before downloading, the updater checks free space on the models volume. The
+estimate includes remaining downloads, space for backups, and a reserve at
+least as large as the biggest selected file. Staging on another volume is
+rejected.
+
 ## Notes
 
 - Public repos need no token. Gated and private models use normal Hugging Face

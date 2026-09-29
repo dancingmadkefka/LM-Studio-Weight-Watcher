@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import contextlib
 import hashlib
 import io
@@ -386,6 +387,75 @@ class ExecutionTests(unittest.TestCase):
             )],
         )
         return build_update_plan([result], models_root=root, safety_reserve_bytes=0)
+
+    def test_missing_xet_emits_one_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old", b"one"), ("two.gguf", b"old", b"two")]
+            )
+            events = []
+            with patch("lmstudio_weight_updater.check_xet_acceleration",
+                       return_value=(False, "hf_xet is missing")) as check:
+                result = UpdateExecutor(
+                    plan, downloader=FakeDownloader(contents), progress=events.append
+                ).execute(post_install_validator=lambda _plan: None)
+            warnings = [event for event in events if "slower HTTP path" in event.message]
+            self.assertTrue(result.success)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("hf_xet is missing", warnings[0].message)
+            check.assert_called_once()
+
+    def test_present_xet_emits_no_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            events = []
+            with patch("lmstudio_weight_updater.check_xet_acceleration", return_value=(True, "")):
+                UpdateExecutor(plan, downloader=FakeDownloader(contents), progress=events.append).execute(
+                    post_install_validator=lambda _plan: None
+                )
+            self.assertFalse(any("Xet" in event.message or "transfers" in event.message
+                                 for event in events))
+
+    def test_missing_xet_still_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            downloader = FakeDownloader(contents)
+            with patch("lmstudio_weight_updater.check_xet_acceleration",
+                       return_value=(False, "hf_xet is missing")):
+                result = UpdateExecutor(plan, downloader=downloader).execute(
+                    post_install_validator=lambda _plan: None
+                )
+            self.assertTrue(result.success)
+            self.assertEqual(downloader.calls, ["model.gguf"])
+
+    def test_availability_check_tolerates_missing_hub(self) -> None:
+        from lmstudio_weight_updater import check_xet_acceleration
+        imports = []
+        def missing_hub(name):
+            imports.append(name)
+            raise ImportError("missing hub")
+        with patch("lmstudio_weight_updater.importlib.import_module", side_effect=missing_hub):
+            available, reason = check_xet_acceleration(Path("scratch") / ".hf-xet")
+        self.assertFalse(available)
+        self.assertIn("huggingface_hub", reason)
+        self.assertEqual(imports, ["huggingface_hub"])
+
+    def test_import_error_message_no_longer_requires_xet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, _contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            original_import = builtins.__import__
+            def missing_hub(name, *args, **kwargs):
+                if name == "huggingface_hub":
+                    raise ImportError("missing hub")
+                return original_import(name, *args, **kwargs)
+            with patch("builtins.__import__", side_effect=missing_hub):
+                with self.assertRaises(UpdateError) as raised:
+                    HuggingFaceDownloader().download(
+                        plan.artifacts[0], cancellation=CancellationToken(),
+                        progress=lambda _done, _total: None,
+                    )
+            self.assertIn("requires huggingface_hub", str(raised.exception))
+            self.assertIn("hf_xet is optional", str(raised.exception))
 
     def test_plan_does_not_reread_verified_staged_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import errno
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -855,6 +856,26 @@ def _scoped_xet_cache(cache_dir: Path):
                 os.environ["HF_XET_CACHE"] = previous
 
 
+def check_xet_acceleration(cache_dir: Path) -> tuple[bool, str]:
+    """Check Hub and Xet separately so a missing Hub never imports hf_xet."""
+    try:
+        importlib.import_module("huggingface_hub")
+    except (ImportError, OSError):
+        return False, "huggingface_hub is unavailable"
+    with _scoped_xet_cache(cache_dir):
+        try:
+            importlib.import_module("hf_xet")
+        except (ImportError, OSError):
+            return False, "hf_xet is not installed or cannot load"
+        try:
+            runtime = importlib.import_module("huggingface_hub.utils._runtime")
+            if not runtime.is_xet_available():
+                return False, "Xet is disabled or unavailable to huggingface_hub"
+        except (ImportError, AttributeError):
+            return False, "this huggingface_hub version cannot use hf_xet"
+    return True, ""
+
+
 class HuggingFaceDownloader:
     """Lazy Hugging Face downloader with resumable local-dir semantics."""
 
@@ -873,7 +894,7 @@ class HuggingFaceDownloader:
                 from tqdm.auto import tqdm
             except ImportError as exc:
                 raise UpdateError(
-                    "Downloading requires huggingface_hub and hf_xet. "
+                    "Downloading requires huggingface_hub and tqdm; hf_xet is optional for speed. "
                     "Install the project's requirements and retry."
                 ) from exc
 
@@ -983,6 +1004,7 @@ class UpdateExecutor:
             self.plan, "downloading", owned_staging_files=owned_staging_files
         )
         try:
+            xet_checked = False
             for artifact in self.plan.artifacts:
                 self.cancellation.raise_if_cancelled()
                 download_root = artifact.download_dir.resolve(strict=False)
@@ -994,6 +1016,16 @@ class UpdateExecutor:
                     self.plan, "downloading", owned_staging_files=owned_staging_files
                 )
                 if not artifact.staged_path.is_file() or artifact.staged_path.stat().st_size != artifact.expected_size:
+                    if not xet_checked:
+                        available, reason = check_xet_acceleration(
+                            artifact.download_dir / ".hf-xet"
+                        )
+                        xet_checked = True
+                        if not available:
+                            self._emit(
+                                "downloading",
+                                f"Xet acceleration unavailable ({reason}); transfers will use the slower HTTP path.",
+                            )
                     self._emit("downloading", f"Downloading {artifact.label}", artifact=artifact)
                     try:
                         self.downloader.download(

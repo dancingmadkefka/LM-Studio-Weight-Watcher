@@ -70,6 +70,10 @@ All three accept `--models-root`, `--state-file`, and `--timeout-seconds`.
    files are left in place and reported.
 6. Cleanup only deletes files recorded as updater backups or staging files.
 
+`huggingface_hub` is required for downloads. `hf_xet` is recommended for speed;
+when it is missing or disabled, the updater reports once per job that downloads
+will use the slower HTTP path and continues the update.
+
 Before deleting a backup, cleanup flushes its directory on systems that allow
 it. Windows has no directory fsync; on NTFS, cleanup relies on metadata
 ordering.

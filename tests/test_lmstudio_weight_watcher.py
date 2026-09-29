@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import tkinter as tk
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from lmstudio_alert_state import load_state
 from lmstudio_weight_watcher import (
     CheckOutcome,
     RecoveryWorkerOutcome,
@@ -18,7 +20,7 @@ from lmstudio_weight_watcher import (
     remote_file_basename,
     split_remote_repo,
 )
-from lmstudio_weight_updater import CancellationToken, ProgressEvent, UpdatePlan
+from lmstudio_weight_updater import CancellationToken, ProgressEvent, RecoveryAction, UpdatePlan
 
 
 class HfUrlTests(unittest.TestCase):
@@ -152,8 +154,117 @@ class WatcherLifecycleTests(unittest.TestCase):
                 RecoveryWorkerOutcome(None, [], "models root unavailable")
             )
         self.assertEqual(app.state["active_update"]["job_id"], "job-1")
-        save_state.assert_not_called()
+        self.assertIn("models root unavailable", app.state["recovery_notice"]["message"])
+        save_state.assert_called_once()
         app.run_check_async.assert_called_once_with(reschedule=True)
+
+    def test_recovery_reported_actions_are_visible(self) -> None:
+        app = self.make_app()
+        app.run_check_async = Mock()
+        actions = [
+            RecoveryAction("job", "reported", f"path-{index}", "Needs inspection")
+            for index in range(2)
+        ]
+        with patch("lmstudio_weight_watcher.save_state") as save_state:
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), actions, None))
+        message = app.state["recovery_notice"]["message"]
+        self.assertIn("2 need attention", message)
+        app.status_var.set.assert_called_with(message)
+        app.maybe_raise_pending_window.assert_called_once_with(force=True)
+        save_state.assert_called_once()
+        app.make_icon_image = Mock()
+        app.refresh_tray_icon()
+        self.assertEqual(app.make_icon_image.call_args.args[0], 1)
+
+    def test_recovery_notice_survives_state_reload_and_reaches_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_app()
+            app.state_path = Path(tmp) / "state.json"
+            app.run_check_async = Mock()
+            action = RecoveryAction("job", "reported", "path", "Needs inspection")
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
+            app.state = load_state(app.state_path)
+            self.assertTrue(app.state["recovery_notice"]["attention"])
+            app.unresolved_text = Mock()
+            app._refresh_unresolved()
+            inserted = [call.args[1] for call in app.unresolved_text.insert.call_args_list]
+            self.assertIn("Recovery\n", inserted)
+            self.assertIn(app.state["recovery_notice"]["message"] + "\n", inserted)
+
+    def test_recovery_message_survives_following_check(self) -> None:
+        app = self.make_app()
+        app.run_check_async = Mock()
+        action = RecoveryAction("job", "reported", "path", "Needs inspection")
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
+            message = app.state["recovery_notice"]["message"]
+            app.run_check_async = WatcherApp.run_check_async.__get__(app)
+            with patch("lmstudio_weight_watcher.threading.Thread"):
+                app.run_check_async(reschedule=False)
+            app.status_var.set.assert_called_with(message)
+            app.finish_check(CheckOutcome(Path("models"), [], None, datetime.now(timezone.utc)),
+                             reschedule=False)
+        self.assertEqual(app.state["recovery_notice"]["message"], message)
+        app.status_var.set.assert_called_with(message)
+
+    def test_recovery_notice_survives_state_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self.make_app()
+            app.state_path = Path(tmpdir) / "state.json"
+            app.run_check_async = Mock()
+            action = RecoveryAction("job", "reported", "path", "Needs inspection")
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
+            reloaded = load_state(app.state_path)
+            self.assertEqual(reloaded["recovery_notice"], app.state["recovery_notice"])
+            self.assertTrue(reloaded["recovery_notice"]["attention"])
+
+    def test_recovery_error_is_persisted_and_redacted(self) -> None:
+        app = self.make_app()
+        app.run_check_async = Mock()
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.finish_recovery(RecoveryWorkerOutcome(None, [], "hf_token=secret123"))
+            message = app.state["recovery_notice"]["message"]
+            app.finish_check(CheckOutcome(None, [], None, datetime.now(timezone.utc)),
+                             reschedule=False)
+        self.assertNotIn("secret123", message)
+        self.assertIn("Recovery check failed", message)
+        app.status_var.set.assert_called_with(message)
+
+    def test_recovery_restored_is_informational(self) -> None:
+        app = self.make_app()
+        app.run_check_async = Mock()
+        action = RecoveryAction("job", "restored", "path", "Restored")
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
+        self.assertIn("1 restored", app.state["recovery_notice"]["message"])
+        self.assertFalse(app.state["recovery_notice"]["attention"])
+        app.maybe_raise_pending_window.assert_called_once_with(force=False)
+        app.make_icon_image = Mock()
+        app.refresh_tray_icon()
+        self.assertEqual(app.make_icon_image.call_args.args[0], 0)
+
+    def test_recovery_quit_after_update_persists_notice(self) -> None:
+        app = self.make_app()
+        app.quit_after_update = True
+        app.quit = Mock()
+        app.run_check_async = Mock()
+        action = RecoveryAction("job", "reported", "path", "Needs inspection")
+        with patch("lmstudio_weight_watcher.save_state") as save_state:
+            app.quit.side_effect = lambda: self.assertTrue(save_state.called)
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
+        app.quit.assert_called_once()
+        app.run_check_async.assert_not_called()
+        self.assertTrue(app.state["recovery_notice"]["attention"])
+
+    def test_recovery_no_actions_stays_quiet(self) -> None:
+        app = self.make_app()
+        app.run_check_async = Mock()
+        with patch("lmstudio_weight_watcher.save_state") as save_state:
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [], None))
+        self.assertNotIn("recovery_notice", app.state)
+        app.status_var.set.assert_not_called()
+        app.maybe_raise_pending_window.assert_called_once_with(force=False)
+        save_state.assert_not_called()
 
     def make_plan(self) -> UpdatePlan:
         return UpdatePlan(

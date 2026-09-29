@@ -363,6 +363,9 @@ class WatcherApp:
             return f"Updating models... ({pending_count} pending)"
         if self.check_in_progress:  
             return f"Checking models... (last total {checked})"  
+        notice = self.state.get("recovery_notice")
+        if isinstance(notice, dict) and notice.get("attention"):
+            return "Recovery needs attention · Open Alerts"
         return f"{pending_count} pending · {checked} models tracked"  
   
     def on_open_alerts(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  
@@ -400,7 +403,11 @@ class WatcherApp:
                 self.schedule_next_check()
             return
         self.check_in_progress = True  
-        self.status_var.set("Checking for remote updates...")  
+        notice = self.state.get("recovery_notice")
+        self.status_var.set(
+            notice["message"] if isinstance(notice, dict) and notice.get("message")
+            else "Checking for remote updates..."
+        )
         self.refresh_tray_icon()  
         threading.Thread(  
             target=self.check_worker,  
@@ -435,10 +442,12 @@ class WatcherApp:
         )  
         save_state(self.state_path, self.state)  
   
-        self.status_var.set(  
-            f"Last checked {format_local(outcome.generated_at_utc)}"  
-            + (f"  ·  Error: {outcome.error}" if outcome.error else "")  
-        )  
+        notice = self.state.get("recovery_notice")
+        self.status_var.set(
+            notice["message"] if isinstance(notice, dict) and notice.get("message")
+            else f"Last checked {format_local(outcome.generated_at_utc)}"
+            + (f"  ·  Error: {outcome.error}" if outcome.error else "")
+        )
         self.refresh_ui()  
         self.maybe_raise_pending_window(force=False)  
         if reschedule:  
@@ -477,31 +486,47 @@ class WatcherApp:
             return
         self.recovery_in_progress = False
         self.last_models_root = outcome.models_root
-        if outcome.error:
-            self.status_var.set(f"Recovery check failed: {outcome.error}")
         active = self.state.get("active_update")
-        if not outcome.error and isinstance(active, dict):
-            restored = sum(action.action == "restored" for action in outcome.actions)
-            message = "Previous update was interrupted."
-            if restored:
-                message += f" Restored {restored} file(s) from rollback."
-            elif outcome.actions:
-                message += " Recovery details require attention."
+        restored = sum(action.action == "restored" for action in outcome.actions)
+        cleanup_pending = sum(action.action == "cleanup-pending" for action in outcome.actions)
+        attention = sum(action.action == "reported" for action in outcome.actions)
+        error = redact_sensitive(outcome.error) if outcome.error else None
+        if error or outcome.actions:
+            message = (
+                f"Recovery check failed: {error}" if error else
+                f"Recovery: {restored} restored, {cleanup_pending} cleanup pending, "
+                f"{attention} need attention."
+            )
+            self.state["recovery_notice"] = {
+                "message": message,
+                "attention": bool(error or attention),
+                "updated_utc": format_utc(datetime.now(timezone.utc)),
+            }
+            if isinstance(active, dict) and not error:
+                self.state = record_update_finished(
+                    self.state, success=False, message=message,
+                    now_utc=datetime.now(timezone.utc),
+                )
+            save_state(self.state_path, self.state)
+            self.status_var.set(message)
+        elif isinstance(active, dict):
             self.state = record_update_finished(
                 self.state,
                 success=False,
-                message=message,
+                message="Previous update was interrupted; no recovery action was needed.",
                 now_utc=datetime.now(timezone.utc),
             )
             save_state(self.state_path, self.state)
-            self.status_var.set(message)
+        notice = self.state.get("recovery_notice")
         self.refresh_ui()
         if self.quit_after_update:
             self.quit_after_update = False
             self.quit()
             return
         self.run_check_async(reschedule=True)
-        self.maybe_raise_pending_window(force=False)
+        self.maybe_raise_pending_window(
+            force=isinstance(notice, dict) and bool(notice.get("attention"))
+        )
 
     def update_selected(self) -> None:
         keys = [
@@ -1507,6 +1532,14 @@ class WatcherApp:
   
         last_error = self.state.get("last_error")  
         unresolved = self.state.get("unresolved", [])  
+        notice = self.state.get("recovery_notice")
+        if isinstance(notice, dict) and notice.get("message"):
+            tag = "error_heading" if notice.get("attention") else "unresolved_heading"
+            self.unresolved_text.insert(tk.END, "Recovery\n", tag)
+            self.unresolved_text.insert(tk.END, f"{notice['message']}\n",
+                                        "error_body" if notice.get("attention") else "muted")
+            if last_error or unresolved:
+                self.unresolved_text.insert(tk.END, "\n")
   
         if last_error:  
             self.unresolved_text.insert(tk.END, "Last error\n", "error_heading")  
@@ -1538,7 +1571,7 @@ class WatcherApp:
                     )
                 self.unresolved_text.insert(tk.END, f"\n      {msg}\n")  
   
-        if not last_error and not unresolved:  
+        if not last_error and not unresolved and not (isinstance(notice, dict) and notice.get("message")):
             self.unresolved_text.insert(  
                 tk.END,  
                 "All clear. No errors and no unresolved items.",  
@@ -1650,12 +1683,16 @@ class WatcherApp:
     def refresh_tray_icon(self) -> None:  
         now_utc = datetime.now(timezone.utc)  
         pending_count = len(pending_alerts(self.state, now_utc))  
+        notice = self.state.get("recovery_notice")
+        recovery_attention = isinstance(notice, dict) and bool(notice.get("attention"))
         busy = self.recovery_in_progress or self.check_in_progress or self.update_in_progress
-        self.icon.icon = self.make_icon_image(pending_count, busy=busy)  
+        self.icon.icon = self.make_icon_image(max(pending_count, int(recovery_attention)), busy=busy)
         if self.update_in_progress:
             status_text = "updating models"
         elif self.check_in_progress:
             status_text = "checking"
+        elif recovery_attention:
+            status_text = "recovery needs attention"
         else:
             status_text = f"{pending_count} pending alerts"
         last_checked = self.state.get("last_checked_utc") or "never"  

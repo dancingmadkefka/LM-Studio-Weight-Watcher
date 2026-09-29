@@ -25,11 +25,13 @@ from lmstudio_weight_updater import (
     UpdateError,
     UpdateExecutor,
     _select_results,
+    _verification_marker_path,
     build_update_plan,
     cleanup_pending_backups,
     main,
     parse_args,
     recover_interrupted_jobs,
+    verify_staged_artifact,
     summarize_recovery_actions,
     write_manifest,
 )
@@ -373,6 +375,163 @@ class ExecutionTests(unittest.TestCase):
         result = check_result(key="model", name="Model", repo="org/repo", artifacts=artifacts)
         plan = build_update_plan([result], models_root=root, safety_reserve_bytes=0)
         return root, plan, contents
+
+    def rebuild_staged_plan(self, root: Path, plan, content: bytes):
+        artifact = plan.artifacts[0]
+        result = check_result(
+            key="model", name="Model", repo="org/repo",
+            artifacts=[artifact_result(
+                destination=artifact.destination, remote_file=artifact.remote_file,
+                content=content,
+            )],
+        )
+        return build_update_plan([result], models_root=root, safety_reserve_bytes=0)
+
+    def test_plan_does_not_reread_verified_staged_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            artifact.staged_path.parent.mkdir(parents=True)
+            artifact.staged_path.write_bytes(contents[artifact.remote_file])
+            verify_staged_artifact(artifact, cancellation=CancellationToken())
+            staged_bytes_read = 0
+            original_open = Path.open
+            class CountedReader:
+                def __init__(self, handle):
+                    self.handle = handle
+                def __enter__(self):
+                    self.handle.__enter__()
+                    return self
+                def __exit__(self, *args):
+                    return self.handle.__exit__(*args)
+                def read(self, *args, **kwargs):
+                    nonlocal staged_bytes_read
+                    data = self.handle.read(*args, **kwargs)
+                    staged_bytes_read += len(data)
+                    return data
+                def __getattr__(self, name):
+                    return getattr(self.handle, name)
+            def count_open(path, *args, **kwargs):
+                handle = original_open(path, *args, **kwargs)
+                return CountedReader(handle) if path == artifact.staged_path else handle
+            with patch.object(Path, "open", count_open):
+                rebuilt = self.rebuild_staged_plan(root, plan, contents[artifact.remote_file])
+            self.assertEqual(staged_bytes_read, 0)
+            self.assertEqual(rebuilt.remaining_download_bytes, 0)
+
+    def test_marker_written_after_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            marker = _verification_marker_path(artifact.staged_path)
+            observed = []
+            def observe_move(source, destination):
+                if Path(source) == artifact.staged_path and Path(destination) == artifact.destination:
+                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                    manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+                    observed.append((payload, manifest))
+                os.replace(source, destination)
+            UpdateExecutor(
+                plan, downloader=FakeDownloader(contents), replace_file=observe_move
+            ).execute(post_install_validator=lambda _plan: None)
+            self.assertEqual(len(observed), 1)
+            payload, manifest = observed[0]
+            self.assertEqual(payload["expected_size"], artifact.expected_size)
+            self.assertEqual(payload["expected_sha256"], artifact.expected_sha256)
+            self.assertEqual(payload["staged_size"], artifact.expected_size)
+            self.assertIsInstance(payload["st_mtime_ns"], int)
+            self.assertIn(str(marker), manifest["owned_staging_files"])
+
+    def test_stale_marker_mtime_invalidates_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            artifact.staged_path.parent.mkdir(parents=True)
+            artifact.staged_path.write_bytes(contents[artifact.remote_file])
+            verify_staged_artifact(artifact, cancellation=CancellationToken())
+            stat = artifact.staged_path.stat()
+            os.utime(artifact.staged_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+            rebuilt = self.rebuild_staged_plan(root, plan, contents[artifact.remote_file])
+            self.assertEqual(rebuilt.remaining_download_bytes, artifact.expected_size)
+
+    def test_marker_hash_mismatch_invalidates_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            artifact.staged_path.parent.mkdir(parents=True)
+            artifact.staged_path.write_bytes(contents[artifact.remote_file])
+            verify_staged_artifact(artifact, cancellation=CancellationToken())
+            marker = _verification_marker_path(artifact.staged_path)
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            payload["expected_sha256"] = "0" * 64
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            rebuilt = self.rebuild_staged_plan(root, plan, contents[artifact.remote_file])
+            self.assertEqual(rebuilt.remaining_download_bytes, artifact.expected_size)
+
+    def test_marker_size_mismatch_invalidates_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            artifact.staged_path.parent.mkdir(parents=True)
+            artifact.staged_path.write_bytes(contents[artifact.remote_file])
+            verify_staged_artifact(artifact, cancellation=CancellationToken())
+            marker = _verification_marker_path(artifact.staged_path)
+            for field in ("expected_size", "staged_size"):
+                with self.subTest(field=field):
+                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                    payload[field] += 1
+                    marker.write_text(json.dumps(payload), encoding="utf-8")
+                    rebuilt = self.rebuild_staged_plan(root, plan, contents[artifact.remote_file])
+                    self.assertEqual(rebuilt.remaining_download_bytes, artifact.expected_size)
+                    payload[field] -= 1
+                    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_corrupt_marker_does_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            artifact.staged_path.parent.mkdir(parents=True)
+            artifact.staged_path.write_bytes(contents[artifact.remote_file])
+            _verification_marker_path(artifact.staged_path).write_text("{broken", encoding="utf-8")
+            rebuilt = self.rebuild_staged_plan(root, plan, contents[artifact.remote_file])
+            self.assertEqual(rebuilt.remaining_download_bytes, artifact.expected_size)
+
+    def test_marker_is_cleaned_up_with_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            marker = _verification_marker_path(plan.artifacts[0].staged_path)
+            result = UpdateExecutor(plan, downloader=FakeDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            self.assertTrue(result.success)
+            self.assertFalse(marker.exists())
+
+    def test_marker_ownership_survives_interrupted_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            marker = _verification_marker_path(artifact.staged_path)
+            def fail_install(source, destination):
+                if Path(source) == artifact.staged_path and Path(destination) == artifact.destination:
+                    raise OSError("install interrupted")
+                os.replace(source, destination)
+            with self.assertRaisesRegex(InstallError, "install interrupted"):
+                UpdateExecutor(
+                    plan, downloader=FakeDownloader(contents), replace_file=fail_install
+                ).execute(post_install_validator=lambda _plan: None)
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(marker.exists())
+            self.assertIn(str(marker), manifest["owned_staging_files"])
+
+    def test_marker_is_not_written_after_failed_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, _contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            artifact.staged_path.parent.mkdir(parents=True)
+            artifact.staged_path.write_bytes(b"bad")
+            with self.assertRaises(IntegrityError):
+                verify_staged_artifact(artifact, cancellation=CancellationToken())
+            self.assertFalse(_verification_marker_path(artifact.staged_path).exists())
 
     def test_downloader_passes_cache_dir_in_staging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1256,6 +1415,17 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual([(action.action, action.path) for action in actions],
                              [("reported", str(orphan))])
             self.assertEqual(orphan.read_bytes(), b"keep")
+
+    def test_marker_is_not_deleted_when_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp))
+            marker = plan.staging_root / "downloads" / "orphan" / "model.gguf.verified.json"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("unknown", encoding="utf-8")
+            actions = recover_interrupted_jobs(root)
+            self.assertTrue(marker.exists())
+            self.assertTrue(any(action.action == "reported" and action.path == str(marker)
+                                for action in actions))
 
     def test_cancelled_manifest_is_pruned_but_unknown_file_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

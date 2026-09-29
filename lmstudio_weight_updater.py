@@ -277,17 +277,33 @@ def _ensure_within(path: Path, root: Path, *, label: str) -> Path:
     return resolved
 
 
+def _verification_marker_path(path: Path) -> Path:
+    return path.with_name(path.name + ".verified.json")
+
+
 def _reusable_staged_bytes(path: Path, expected_size: int, expected_sha256: str) -> int:
-    """Count only a complete staged artifact whose bytes are already verified."""
+    """Use verification metadata to estimate reusable staged bytes without hashing."""
     try:
-        if not path.is_file() or path.stat().st_size != expected_size:
+        if not path.is_file():
             return 0
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
-                digest.update(chunk)
-        return expected_size if digest.hexdigest() == expected_sha256 else 0
-    except OSError:
+        stat = path.stat()
+        if stat.st_size != expected_size:
+            return 0
+        marker = json.loads(_verification_marker_path(path).read_text(encoding="utf-8"))
+        if not isinstance(marker, dict):
+            return 0
+        if (type(marker.get("expected_size")) is not int
+                or type(marker.get("staged_size")) is not int
+                or type(marker.get("st_mtime_ns")) is not int):
+            return 0
+        if (marker.get("version") != 1
+                or marker["expected_size"] != expected_size
+                or marker.get("expected_sha256") != expected_sha256
+                or marker["staged_size"] != stat.st_size
+                or marker["st_mtime_ns"] != stat.st_mtime_ns):
+            return 0
+        return expected_size
+    except (OSError, ValueError, TypeError):
         return 0
 
 
@@ -771,9 +787,15 @@ def verify_staged_artifact(
     cancellation: CancellationToken,
     progress: Callable[[int, int], None] | None = None,
 ) -> None:
+    marker_path = _verification_marker_path(artifact.staged_path)
+    try:
+        marker_path.unlink(missing_ok=True)
+    except OSError:
+        pass
     if not artifact.staged_path.is_file():
         raise IntegrityError(f"Downloaded file is missing: {artifact.staged_path}")
-    size = artifact.staged_path.stat().st_size
+    before = artifact.staged_path.stat()
+    size = before.st_size
     if size != artifact.expected_size:
         raise IntegrityError(
             f"Size mismatch for {artifact.label}: expected {artifact.expected_size}, got {size}."
@@ -788,6 +810,20 @@ def verify_staged_artifact(
             f"SHA-256 mismatch for {artifact.label}: expected "
             f"{artifact.expected_sha256}, got {digest.lower()}."
         )
+    after = artifact.staged_path.stat()
+    if after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
+        raise IntegrityError(f"Staged file changed during verification: {artifact.staged_path}")
+    try:
+        _write_json_atomic(marker_path, {
+            "version": 1,
+            "expected_size": artifact.expected_size,
+            "expected_sha256": artifact.expected_sha256,
+            "staged_size": after.st_size,
+            "st_mtime_ns": after.st_mtime_ns,
+        })
+    except OSError:
+        # Reuse is optional; a missing marker makes the next plan conservative.
+        pass
 
 
 @contextmanager
@@ -991,6 +1027,12 @@ class UpdateExecutor:
                         total=total,
                     ),
                 )
+                marker = _verification_marker_path(artifact.staged_path)
+                if marker.is_file():
+                    owned_staging_files.add(marker)
+                    write_manifest(
+                        self.plan, "downloading", owned_staging_files=owned_staging_files
+                    )
 
             self._emit(
                 "installing",

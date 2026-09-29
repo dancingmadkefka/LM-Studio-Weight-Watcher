@@ -1529,13 +1529,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--all", action="store_true", help="Update every model with downloadable changed artifacts.")
     selection.add_argument("--model-key", action="append", help="Update one model key; repeat to select multiple models.")
-    parser.add_argument("--dry-run", action="store_true", help="Print the validated plan without downloading or changing files.")
+    parser.add_argument("--dry-run", action="store_true", help="Print the validated plan as JSON without downloading or changing files, with or without --json.")
     parser.add_argument("--yes", action="store_true", help="Confirm replacement without an interactive prompt.")
     parser.add_argument("--keep-backups", action="store_true", help="Keep rollback files indefinitely after a successful update.")
     parser.add_argument("--models-root", type=Path, help="Override the LM Studio models root.")
     parser.add_argument("--state-file", type=Path, help="Override watcher state used for alert refresh and hash cache placement.")
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
-    parser.add_argument("--json", action="store_true", help="Print plan/result as JSON.")
+    parser.add_argument("--json", action="store_true", help="Print the update result as JSON; dry runs always print a JSON plan.")
     return parser.parse_args(argv)
 
 

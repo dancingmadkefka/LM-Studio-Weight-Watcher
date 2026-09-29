@@ -42,7 +42,7 @@ Alerts can be acknowledged or snoozed.
 | `lmstudio_weight_updater.py` | Download and install updates from the CLI |
 
 ```powershell
-# Show what would happen, download nothing
+# Show the plan as JSON; download nothing
 .\.venv\Scripts\python.exe .\lmstudio_weight_updater.py --all --dry-run
 
 # Update every pending model with an available update
@@ -54,6 +54,8 @@ Alerts can be acknowledged or snoozed.
 
 All three accept `--models-root`, `--state-file`, and `--timeout-seconds`.
 `--help` on any script lists the rest.
+The updater's `--dry-run` always prints a JSON plan, with or without `--json`.
+For a normal update, `--json` prints the result as JSON instead of a status line.
 
 ## What happens during an update
 

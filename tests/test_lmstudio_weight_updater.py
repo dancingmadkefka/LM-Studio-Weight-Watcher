@@ -26,6 +26,7 @@ from lmstudio_weight_updater import (
     UpdateCancelled,
     UpdateError,
     UpdateExecutor,
+    UpdateResult,
     _select_results,
     _verification_marker_path,
     build_update_plan,
@@ -1932,7 +1933,65 @@ class CliTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             download.assert_not_called()
-            self.assertIn('"job_id"', output.getvalue())
+            self.assertTrue(output.getvalue().lstrip().startswith("{"))
+            self.assertIn("job_id", json.loads(output.getvalue()))
+
+    def test_dry_run_json_also_prints_plan_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "models"
+            target = root / "org" / "repo" / "model.gguf"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"old")
+            result = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(
+                    destination=target, remote_file="model.gguf", content=b"new"
+                )],
+            )
+            output = io.StringIO()
+            with (patch("lmstudio_weight_updater.discover_models_root", return_value=root),
+                  patch("lmstudio_weight_updater.collect_check_results", return_value=[result]),
+                  contextlib.redirect_stdout(output)):
+                code = main([
+                    "--all", "--dry-run", "--json", "--models-root", str(root),
+                    "--state-file", str(base / "state.json"),
+                ])
+            self.assertEqual(code, 0)
+            self.assertTrue(output.getvalue().lstrip().startswith("{"))
+            self.assertIn("artifacts", json.loads(output.getvalue()))
+
+    def test_normal_update_json_prints_result_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "models"
+            target = root / "org" / "repo" / "model.gguf"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"old")
+            result = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(
+                    destination=target, remote_file="model.gguf", content=b"new"
+                )],
+            )
+            update_result = UpdateResult(
+                job_id="job-test", success=True, updated_paths=(str(target),),
+                backup_paths=(), completed_at_utc="2026-09-29T00:00:00Z", message="Done",
+            )
+            output = io.StringIO()
+            with (patch("lmstudio_weight_updater.discover_models_root", return_value=root),
+                  patch("lmstudio_weight_updater.collect_check_results", return_value=[result]),
+                  patch("lmstudio_weight_updater.run_update_plan", return_value=(update_result, [])),
+                  contextlib.redirect_stdout(output)):
+                code = main([
+                    "--all", "--yes", "--json", "--models-root", str(root),
+                    "--state-file", str(base / "state.json"),
+                ])
+            self.assertEqual(code, 0)
+            self.assertTrue(output.getvalue().lstrip().startswith("{"))
+            parsed = json.loads(output.getvalue())
+            self.assertEqual(parsed["job_id"], "job-test")
+            self.assertTrue(parsed["success"])
 
     def test_all_selects_repairable_missing_local_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

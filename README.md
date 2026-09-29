@@ -86,8 +86,15 @@ rejected.
 - State lives in `%APPDATA%\LM Studio Weight Watcher\state.json`. Older formats
   and locations are migrated.
 - The launcher looks for Python at `%LMSTUDIO_WATCHER_PYTHON%`, then `.venv`,
-  `venv`, `python`, then `py -3`. Problems end up in `watcher-launch.log` and
-  `watcher-error.log` next to the launcher.
+  `venv`, `python`, then `py -3`. Set `LMSTUDIO_WATCHER_PYTHON` to a full
+  `python.exe` path to force one interpreter. The launcher checks each candidate's
+  dependencies before starting and records failures in `watcher-error.log` next
+  to the launcher. A hidden tray launch also shows a Windows error box if no
+  usable interpreter is found.
+- Create `.venv` without `--system-site-packages`. Avoid a conda base that
+  inherits site-packages; a broken package there can override the copy installed
+  in `.venv`. To repair the selected interpreter, run
+  `"<interpreter>" -m pip install -r requirements.txt` from this folder.
 
 ## Tests
 

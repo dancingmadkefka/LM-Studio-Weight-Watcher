@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import argparse
+import contextlib
+import io
+import os
+import shutil
+import subprocess
+import sys
 import tkinter as tk
 import threading
 import tempfile
@@ -11,12 +18,16 @@ from unittest.mock import Mock, patch
 from lmstudio_alert_state import load_state
 from lmstudio_weight_watcher import (
     CheckOutcome,
+    DependencyPreflightResult,
     RecoveryWorkerOutcome,
     UpdateWorkerOutcome,
     WatcherApp,
     format_alert_detail,
     hf_file_url,
     hf_repo_url,
+    format_preflight_failure,
+    main,
+    probe_dependencies,
     remote_file_basename,
     split_remote_repo,
 )
@@ -44,6 +55,81 @@ class HfUrlTests(unittest.TestCase):
             hf_file_url("unsloth/Foo", None),
             "https://huggingface.co/unsloth/Foo",
         )
+
+
+class PreflightTests(unittest.TestCase):
+    def test_preflight_reports_broken_pillow(self) -> None:
+        failure = ImportError("cannot import _imaging", name="PIL._imaging")
+        with patch("lmstudio_weight_watcher._import_dependency", side_effect=failure):
+            result = probe_dependencies()
+        message = format_preflight_failure(result)
+        self.assertEqual(result.failed_import, "PIL._imaging")
+        self.assertIn(sys.executable, message)
+        self.assertIn(f'"{sys.executable}" -m pip install -r requirements.txt', message)
+
+    def test_preflight_passes_with_dependencies(self) -> None:
+        with patch("lmstudio_weight_watcher._import_dependency", return_value=object()):
+            result = probe_dependencies()
+        self.assertIsNone(result.failed_import)
+        self.assertIsNone(result.error)
+
+    def test_preflight_error_exit_code_is_distinct(self) -> None:
+        args = argparse.Namespace(once=True, preflight_only=False)
+        errors = io.StringIO()
+        with (patch("lmstudio_weight_watcher.parse_args", return_value=args),
+              patch("lmstudio_weight_watcher.probe_dependencies",
+                    return_value=DependencyPreflightResult("PIL._imaging", "broken")),
+              patch("lmstudio_weight_watcher.show_preflight_failure") as dialog,
+              contextlib.redirect_stderr(errors)):
+            code = main()
+        self.assertEqual(code, 3)
+        self.assertIn("PIL._imaging", errors.getvalue())
+        dialog.assert_not_called()
+
+    def test_preflight_runs_before_window_creation(self) -> None:
+        order = []
+        args = argparse.Namespace(
+            once=False, preflight_only=False, state_file=Path("test-state.json"),
+            models_root=None, check_interval_hours=6, reminder_interval_minutes=60,
+            snooze_hours=4, timeout_seconds=30,
+        )
+        app = Mock()
+        def probe():
+            order.append("probe")
+            return DependencyPreflightResult(modules={})
+        def create_app(**_kwargs):
+            order.append("window")
+            return app
+        with (patch("lmstudio_weight_watcher.parse_args", return_value=args),
+              patch("lmstudio_weight_watcher.probe_dependencies", side_effect=probe),
+              patch("lmstudio_weight_watcher.WatcherApp", side_effect=create_app)):
+            self.assertEqual(main(), 0)
+        self.assertEqual(order, ["probe", "window"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows batch launcher")
+    def test_hidden_launcher_forwards_eleven_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copy2(Path(__file__).parent.parent / "run_watcher.bat", root / "run_watcher.bat")
+            (root / "lmstudio_weight_watcher.py").write_text("", encoding="utf-8")
+            stub = root / "python-stub.cmd"
+            stub.write_text(
+                '@echo off\nif "%~2"=="--preflight-only" exit /b 0\n'
+                '>"%WATCHER_STUB_OUT%" echo %*\n', encoding="ascii"
+            )
+            output = root / "argv.txt"
+            env = os.environ.copy()
+            env["LMSTUDIO_WATCHER_PYTHON"] = str(stub)
+            env["WATCHER_STUB_OUT"] = str(output)
+            args = [f"arg-{index}" for index in range(11)]
+            completed = subprocess.run(
+                ["cmd", "/c", str(root / "run_watcher.bat"), "--hidden-launch", *args],
+                env=env, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            forwarded = output.read_text(encoding="ascii")
+            positions = [forwarded.index(arg) for arg in args]
+            self.assertEqual(positions, sorted(positions))
 
 
 class RemoteSourceFormattingTests(unittest.TestCase):
@@ -199,6 +285,7 @@ class WatcherLifecycleTests(unittest.TestCase):
             app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
             message = app.state["recovery_notice"]["message"]
             app.run_check_async = WatcherApp.run_check_async.__get__(app)
+            app.make_icon_image = Mock()
             with patch("lmstudio_weight_watcher.threading.Thread"):
                 app.run_check_async(reschedule=False)
             app.status_var.set.assert_called_with(message)

@@ -1,7 +1,8 @@
-from __future__ import annotations  
-  
+from __future__ import annotations
+
 import argparse
 from copy import deepcopy
+import importlib
 import os
 import shutil
 import sys
@@ -13,9 +14,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path  
 import tkinter as tk  
 from tkinter import ttk, font as tkfont, messagebox
-  
-import pystray  
-from PIL import Image, ImageDraw, ImageFont  
   
 from lmstudio_alert_state import (
     LEGACY_APP_NAME,
@@ -105,6 +103,52 @@ class RecoveryWorkerOutcome:
     models_root: Path | None
     actions: list
     error: str | None
+
+
+@dataclass
+class DependencyPreflightResult:
+    failed_import: str | None = None
+    error: str | None = None
+    modules: dict | None = None
+
+
+def _import_dependency(name: str):
+    return importlib.import_module(name)
+
+
+def probe_dependencies() -> DependencyPreflightResult:
+    modules = {}
+    names = ["PIL.Image", "PIL.ImageDraw", "PIL.ImageFont", "pystray"]
+    if os.name == "nt":
+        names.append("windows_toasts")
+    for name in names:
+        try:
+            modules[name] = _import_dependency(name)
+        except Exception as exc:
+            return DependencyPreflightResult(
+                failed_import=getattr(exc, "name", None) or name,
+                error=str(exc),
+            )
+    return DependencyPreflightResult(modules=modules)
+
+
+def format_preflight_failure(result: DependencyPreflightResult) -> str:
+    requirements = Path(__file__).with_name("requirements.txt")
+    command = f'"{sys.executable}" -m pip install -r requirements.txt'
+    return (
+        f"Watcher dependency check failed: {result.failed_import}: {result.error}\n"
+        f"Interpreter: {sys.executable}\n"
+        f"In {requirements.parent}, run: {command}"
+    )
+
+
+def show_preflight_failure(message: str) -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x10)
+        except Exception:
+            pass
   
   
 def parse_args() -> argparse.Namespace:  
@@ -117,6 +161,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-file", type=Path, help="Override the persistent alert state path.")  
     parser.add_argument("--models-root", type=Path, help="Override the LM Studio models root folder.")  
     parser.add_argument("--once", action="store_true", help="Run one check, update state, print a summary, then exit.")  
+    parser.add_argument("--preflight-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--hidden-launch", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(  
         "--check-interval-hours",  
         type=int,  
@@ -149,6 +195,21 @@ def parse_args() -> argparse.Namespace:
   
 def main() -> int:
     args = parse_args()
+    preflight = probe_dependencies()
+    if preflight.failed_import:
+        message = format_preflight_failure(preflight)
+        print(message, file=sys.stderr)
+        if not args.once and not args.preflight_only:
+            show_preflight_failure(message)
+        return 3
+    if args.preflight_only:
+        return 0
+    if preflight.modules:
+        global Image, ImageDraw, ImageFont, pystray
+        Image = preflight.modules["PIL.Image"]
+        ImageDraw = preflight.modules["PIL.ImageDraw"]
+        ImageFont = preflight.modules["PIL.ImageFont"]
+        pystray = preflight.modules["pystray"]
     state_path = (args.state_file or default_state_path()).expanduser()
 
     # Migration: if legacy exists and preferred doesn't, move it.

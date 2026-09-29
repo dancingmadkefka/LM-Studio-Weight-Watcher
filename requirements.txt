@@ -1,5 +1,6 @@
 pystray==0.19.5
 pillow>=10.0
+windows-toasts>=1.3,<2; sys_platform == "win32"
 huggingface_hub>=0.34,<2
 hf_xet>=1.1,<2
 tqdm>=4.66,<5

@@ -602,7 +602,7 @@ def cleanup_pending_backups(
                     raise PlanError(f"Unexpected rollback path: {backup}")
                 allowed.add(backup)
             retained = [Path(value).resolve(strict=False) for value in payload["retained_backups"]]
-            if not retained or len(set(retained)) != len(retained) or any(path not in allowed for path in retained):
+            if len(set(retained)) != len(retained) or any(path not in allowed for path in retained):
                 raise PlanError("Retained backup list does not match the manifest artifacts.")
             model_keys = tuple(str(key) for key in payload["selected_model_keys"])
             if not model_keys:
@@ -629,29 +629,93 @@ def cleanup_pending_backups(
         remaining = list(retained)
         for backup in retained:
             try:
+                removed = False
                 if backup.exists():
                     if not backup.is_file():
                         raise OSError(f"Recorded backup is not a file: {backup}")
                     _flush_parent_directory(backup)
                     backup.unlink()
+                    removed = True
                 remaining.remove(backup)
                 payload["retained_backups"] = [str(path) for path in remaining]
                 _write_json_atomic(manifest_path, payload)
-                actions.append(RecoveryAction(job_id, "cleaned", str(backup), "Removed validated rollback file."))
+                if removed:
+                    actions.append(RecoveryAction(job_id, "cleaned", str(backup), "Removed validated rollback file."))
             except OSError as exc:
                 if not payload.get("cleanup_reported"):
                     payload["cleanup_reported"] = True
                     payload["error"] = redact_sensitive(exc)
                     _write_json_atomic(manifest_path, payload)
                     actions.append(RecoveryAction(job_id, "reported", str(backup), f"Backup cleanup deferred: {redact_sensitive(exc)}"))
-        if not remaining and not _files_under(staging_root / "downloads"):
-            manifest_path.unlink()
-            for directory in (jobs_dir, staging_root):
+        if not remaining:
+            actions.extend(_prune_terminal_manifest(staging_root, manifest_path, payload, root))
+    return actions
+
+
+def _prune_terminal_manifest(
+    staging_root: Path, manifest_path: Path, payload: dict[str, Any], models_root: Path
+) -> list[RecoveryAction]:
+    """Remove recorded staging files before removing their terminal manifest."""
+    job_id = str(payload.get("job_id") or "unknown")
+    downloads_root = staging_root / "downloads"
+    try:
+        if manifest_path.stem != job_id or _safe_resolve(Path(payload["models_root"])) != models_root:
+            raise PlanError("Manifest identity or models root does not match.")
+        directories = [
+            _ensure_within(Path(item["download_dir"]), downloads_root, label="Download directory")
+            for item in payload["artifacts"]
+        ]
+        owned = [
+            _ensure_within(Path(value), downloads_root, label="Owned staging file")
+            for value in payload.get("owned_staging_files", [])
+        ]
+        if any(not any(path.is_relative_to(directory) for directory in directories) for path in owned):
+            raise PlanError("Owned staging file is outside the manifest download directories.")
+    except (KeyError, TypeError, ValueError, PlanError) as exc:
+        return [RecoveryAction(job_id, "reported", str(manifest_path), f"Cannot prune manifest: {redact_sensitive(exc)}")]
+
+    for other_path in (staging_root / "jobs").glob("job-*.json"):
+        if other_path == manifest_path:
+            continue
+        try:
+            other = json.loads(other_path.read_text(encoding="utf-8"))
+            other_directories = {
+                _ensure_within(Path(item["download_dir"]), downloads_root, label="Download directory")
+                for item in other["artifacts"]
+            }
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, PlanError):
+            return [RecoveryAction(job_id, "reported", str(manifest_path),
+                                   "Cannot prune staging while another manifest is unreadable.")]
+        if set(directories) & other_directories:
+            return [RecoveryAction(job_id, "reported", str(manifest_path),
+                                   "Cannot prune staging shared with another job.")]
+
+    # Unknown files are never inferred to belong to this job.
+    unknown = set().union(*(_files_under(directory) for directory in directories)) - set(owned)
+    if unknown:
+        return [RecoveryAction(job_id, "reported", str(manifest_path),
+                               f"Preserved {len(unknown)} unknown staging file(s).")]
+    try:
+        for path in owned:
+            if path.is_file():
+                path.unlink()
+        for directory in sorted(set(directories), key=lambda path: len(path.parts), reverse=True):
+            if directory.is_dir():
+                for child in sorted(directory.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+                    if child.is_dir():
+                        child.rmdir()
+                directory.rmdir()
+        manifest_path.unlink()
+        for directory in (downloads_root, staging_root / "jobs", staging_root):
+            if directory.is_dir():
                 try:
                     directory.rmdir()
                 except OSError:
                     pass
-    return actions
+    except OSError as exc:
+        return [RecoveryAction(job_id, "reported", str(manifest_path),
+                               f"Terminal staging cleanup deferred: {redact_sensitive(exc)}")]
+    return []
 
 
 def compute_verified_sha256(
@@ -1168,30 +1232,39 @@ class UpdateExecutor:
 
 
 def recover_interrupted_jobs(models_root: Path) -> list[RecoveryAction]:
-    """Restore only unambiguous missing destinations recorded in trusted manifests."""
+    """Restore missing destinations and report cleanup that needs a later clean check."""
     root = _safe_resolve(models_root)
     staging_root = staging_root_for(root)
     jobs_dir = staging_root / "jobs"
-    if not jobs_dir.is_dir():
-        return []
     actions: list[RecoveryAction] = []
-    for manifest_path in sorted(jobs_dir.glob("job-*.json")):
+    known_download_dirs: set[Path] = set()
+    manifests = sorted(jobs_dir.glob("job-*.json")) if jobs_dir.is_dir() else []
+    for manifest_path in manifests:
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             actions.append(RecoveryAction("unknown", "reported", str(manifest_path), f"Unreadable manifest: {exc}"))
             continue
-        job_id = str(payload.get("job_id") or "unknown")
-        if payload.get("version") != MANIFEST_VERSION:
-            actions.append(RecoveryAction(job_id, "reported", str(manifest_path), "Unsupported manifest version."))
+        if not isinstance(payload, dict):
+            actions.append(RecoveryAction("unknown", "reported", str(manifest_path), "Unreadable manifest structure."))
             continue
-        completed = payload.get("phase") in {"completed-cleanup-pending", "completed-backups-kept"}
+        job_id = str(payload.get("job_id") or "unknown")
+        if (payload.get("version") != MANIFEST_VERSION or manifest_path.stem != job_id
+                or payload.get("models_root") != str(root)):
+            actions.append(RecoveryAction(job_id, "reported", str(manifest_path), "Unsupported or mismatched manifest."))
+            continue
+        phase = payload.get("phase")
+        cleanup_pending = phase == "completed-cleanup-pending" and not payload.get("keep_backups")
+        outstanding_backup = False
         for item in payload.get("artifacts", []):
             try:
                 destination = _ensure_under(Path(item["destination"]), root, label="Recovery destination")
                 backup = Path(item["backup_path"]).resolve(strict=False)
                 if backup != destination.with_name(destination.name + f".lmww-backup-{job_id}"):
                     raise PlanError(f"Unexpected rollback path: {backup}")
+                known_download_dirs.add(_ensure_within(
+                    Path(item["download_dir"]), staging_root / "downloads", label="Download directory"
+                ))
             except (KeyError, TypeError, PlanError) as exc:
                 actions.append(RecoveryAction(job_id, "reported", str(manifest_path), f"Unsafe manifest entry: {exc}"))
                 continue
@@ -1199,9 +1272,41 @@ def recover_interrupted_jobs(models_root: Path) -> list[RecoveryAction]:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(backup, destination)
                 actions.append(RecoveryAction(job_id, "restored", str(destination), "Restored missing destination from rollback."))
-            elif backup.exists() and not completed:
+                outstanding_backup = True
+            elif backup.exists() and cleanup_pending and destination.is_file():
+                outstanding_backup = True
+                actions.append(RecoveryAction(job_id, "cleanup-pending", str(backup),
+                                              "Validated rollback awaits a later clean model check."))
+            elif backup.exists() and phase != "completed-backups-kept":
+                outstanding_backup = True
                 actions.append(RecoveryAction(job_id, "reported", str(backup), "Destination and rollback both exist; manual inspection required."))
+            elif backup.exists():
+                outstanding_backup = True
+        rollback_status = payload.get("rollback_status", [])
+        if (not outstanding_backup and phase in {"completed", "cancelled", "failed", "completed-cleanup-pending"}
+                and isinstance(rollback_status, list)
+                and all(isinstance(item, dict) and item.get("original_restored", True) for item in rollback_status)):
+            actions.extend(_prune_terminal_manifest(staging_root, manifest_path, payload, root))
+
+    downloads_root = staging_root / "downloads"
+    for path in sorted(_files_under(downloads_root)):
+        if not any(path.is_relative_to(directory) for directory in known_download_dirs):
+            actions.append(RecoveryAction("unknown", "reported", str(path),
+                                          "Staging file has no identifiable manifest; preserved."))
+    if jobs_dir.is_dir():
+        for path in sorted(jobs_dir.iterdir()):
+            if path.is_file() and path not in manifests:
+                actions.append(RecoveryAction("unknown", "reported", str(path),
+                                              "Job file has no identifiable manifest; preserved."))
     return actions
+
+
+def summarize_recovery_actions(actions: Sequence[RecoveryAction]) -> dict[str, int]:
+    return {
+        "restored": sum(action.action == "restored" for action in actions),
+        "cleanup_pending": sum(action.action == "cleanup-pending" for action in actions),
+        "attention": sum(action.action == "reported" for action in actions),
+    }
 
 
 def format_bytes(value: int) -> str:
@@ -1274,8 +1379,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         models_root = discover_models_root(args.models_root)
         recovery = recover_interrupted_jobs(models_root)
-        for action in recovery:
-            print(f"recovery: {action.message} ({action.path})", file=sys.stderr)
+        if recovery:
+            counts = summarize_recovery_actions(recovery)
+            print(
+                "recovery: "
+                f"{counts['restored']} restored, "
+                f"{counts['cleanup_pending']} cleanup pending, "
+                f"{counts['attention']} need attention",
+                file=sys.stderr,
+            )
         initial_results = collect_check_results(
             models_root=models_root,
             timeout_seconds=args.timeout_seconds,

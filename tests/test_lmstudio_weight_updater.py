@@ -24,6 +24,7 @@ from lmstudio_weight_updater import (
     main,
     parse_args,
     recover_interrupted_jobs,
+    summarize_recovery_actions,
     write_manifest,
 )
 
@@ -876,6 +877,108 @@ class ExecutionTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def make_plan(self, base: Path, names: tuple[str, ...] = ("one.gguf",)):
+        root = base / "models"
+        root.mkdir(exist_ok=True)
+        artifacts = []
+        for name in names:
+            target = root / "org" / "repo" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"old")
+            artifacts.append(artifact_result(destination=target, remote_file=name, content=b"new"))
+        plan = build_update_plan(
+            [check_result(key="model", name="Model", repo="org/repo", artifacts=artifacts)],
+            models_root=root, safety_reserve_bytes=0,
+        )
+        return root, plan
+
+    def test_recovery_finishes_interrupted_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp), ("one.gguf", "two.gguf", "three.gguf"))
+            for artifact in plan.artifacts:
+                artifact.destination.write_bytes(b"new")
+                artifact.backup_path.write_bytes(b"old")
+            write_manifest(plan, "completed-cleanup-pending",
+                           retained_backups=[artifact.backup_path for artifact in plan.artifacts])
+            for artifact in plan.artifacts[:2]:
+                artifact.backup_path.unlink()
+            pending = recover_interrupted_jobs(root)
+            self.assertEqual([action.action for action in pending], ["cleanup-pending"])
+            self.assertTrue(plan.artifacts[2].backup_path.exists())
+            cleaned = cleanup_pending_backups(root, model_is_current=lambda _keys: True)
+            self.assertEqual([action.action for action in cleaned], ["cleaned"])
+            self.assertFalse(plan.manifest_path.exists())
+            self.assertFalse(plan.staging_root.exists())
+
+    def test_recovery_does_not_delete_without_cleanup_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp))
+            artifact = plan.artifacts[0]
+            artifact.backup_path.write_bytes(b"old")
+            write_manifest(plan, "installing")
+            actions = recover_interrupted_jobs(root)
+            self.assertEqual([action.action for action in actions], ["reported"])
+            self.assertTrue(artifact.backup_path.exists())
+
+    def test_recovery_reports_counts_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp), ("one.gguf", "two.gguf", "three.gguf"))
+            write_manifest(plan, "installing")
+            first, second, third = plan.artifacts
+            first.backup_path.write_bytes(b"old")
+            first.destination.unlink()
+            second.backup_path.write_bytes(b"old")
+            orphan = plan.staging_root / "downloads" / "orphan" / "stray.bin"
+            orphan.parent.mkdir(parents=True)
+            orphan.write_bytes(b"stray")
+            actions = recover_interrupted_jobs(root)
+            self.assertEqual(summarize_recovery_actions(actions),
+                             {"restored": 1, "cleanup_pending": 0, "attention": 2})
+            self.assertEqual(first.destination.read_bytes(), b"old")
+            again = recover_interrupted_jobs(root)
+            self.assertFalse(any(action.action == "restored" for action in again))
+            self.assertEqual(orphan.read_bytes(), b"stray")
+            self.assertTrue(third.destination.exists())
+
+    def test_terminal_manifest_is_pruned_with_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp))
+            staged = plan.artifacts[0].staged_path
+            staged.parent.mkdir(parents=True)
+            staged.write_bytes(b"new")
+            write_manifest(plan, "completed", owned_staging_files=[staged])
+            self.assertEqual(recover_interrupted_jobs(root), [])
+            self.assertFalse(plan.manifest_path.exists())
+            self.assertFalse(staged.exists())
+
+    def test_orphan_staging_is_reported_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "models"
+            root.mkdir()
+            orphan = root.parent / ".weight-watcher-staging" / "downloads" / "orphan.bin"
+            orphan.parent.mkdir(parents=True)
+            orphan.write_bytes(b"keep")
+            actions = recover_interrupted_jobs(root)
+            self.assertEqual([(action.action, action.path) for action in actions],
+                             [("reported", str(orphan))])
+            self.assertEqual(orphan.read_bytes(), b"keep")
+
+    def test_cancelled_manifest_is_pruned_but_unknown_file_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp))
+            directory = plan.artifacts[0].download_dir
+            directory.mkdir(parents=True)
+            unknown = directory / "unknown.txt"
+            unknown.write_text("keep", encoding="utf-8")
+            write_manifest(plan, "cancelled")
+            actions = recover_interrupted_jobs(root)
+            self.assertEqual([action.action for action in actions], ["reported"])
+            self.assertTrue(plan.manifest_path.exists())
+            self.assertTrue(unknown.exists())
+            unknown.unlink()
+            self.assertEqual(recover_interrupted_jobs(root), [])
+            self.assertFalse(plan.manifest_path.exists())
+
     def test_recovery_restores_only_manifested_missing_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -901,6 +1004,30 @@ class RecoveryTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_dry_run_prints_recovery_counts_without_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "models"
+            target = root / "org" / "repo" / "model.gguf"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"old")
+            result = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(destination=target, remote_file="model.gguf", content=b"new")],
+            )
+            plan = build_update_plan([result], models_root=root, safety_reserve_bytes=0)
+            write_manifest(plan, "installing")
+            plan.artifacts[0].backup_path.write_bytes(b"old")
+            errors = io.StringIO()
+            with (patch("lmstudio_weight_updater.discover_models_root", return_value=root),
+                  patch("lmstudio_weight_updater.collect_check_results", return_value=[result]),
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors)):
+                self.assertEqual(main(["--all", "--dry-run", "--models-root", str(root),
+                                       "--state-file", str(base / "state.json")]), 0)
+            self.assertEqual(errors.getvalue().strip(),
+                             "recovery: 0 restored, 0 cleanup pending, 1 need attention")
+            self.assertTrue(plan.artifacts[0].backup_path.exists())
+
     def test_second_cli_run_cleans_backup_in_scratch_models_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

@@ -911,6 +911,63 @@ class HashCachePersistenceTests(unittest.TestCase):
             self.assertIn("org/repo/present.gguf", cache)
             self.assertNotIn("org/repo/gone.gguf", cache)
 
+    def test_prune_removes_dead_absolute_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "models"
+            root.mkdir()
+            gone = Path(tmpdir) / "gone.gguf"
+            gone.write_bytes(b"x")
+            gone.unlink()
+            cache = {str(gone): {"sha256": "abc"}}
+            prune_hash_cache(cache, root)
+            self.assertEqual(cache, {})
+
+    def test_prune_keeps_live_absolute_key_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "models"
+            root.mkdir()
+            outside = Path(tmpdir) / "outside.gguf"
+            outside.write_bytes(b"x")
+            cache = {str(outside): {"sha256": "abc"}}
+            prune_hash_cache(cache, root)
+            self.assertEqual(list(cache), [str(outside)])
+
+    def test_prune_keeps_live_relative_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            present = root / "org" / "repo" / "present.gguf"
+            present.parent.mkdir(parents=True)
+            present.write_bytes(b"x")
+            cache = {"org/repo/present.gguf": {"sha256": "abc"}}
+            prune_hash_cache(cache, root)
+            self.assertEqual(list(cache), ["org/repo/present.gguf"])
+
+    def test_prune_removes_dead_relative_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = {"org/repo/gone.gguf": {"sha256": "abc"}}
+            prune_hash_cache(cache, Path(tmpdir))
+            self.assertEqual(cache, {})
+
+    def test_prune_tolerates_malformed_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = {
+                "": {"sha256": "abc"},
+                "a\x00b": {"sha256": "def"},
+                "C:": {"sha256": "ghi"},
+            }
+            prune_hash_cache(cache, Path(tmpdir))
+            self.assertEqual(cache, {})
+
+    def test_prune_bounds_entry_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            live = root / "live.gguf"
+            live.write_bytes(b"x")
+            cache = {f"dead-{index}.gguf": {"sha256": "abc"} for index in range(1000)}
+            cache["live.gguf"] = {"sha256": "def"}
+            prune_hash_cache(cache, root)
+            self.assertEqual(list(cache), ["live.gguf"])
+
 
 class LocalOidCacheTests(unittest.TestCase):
     def test_get_local_oid_serves_cached_value_when_size_and_mtime_match(self) -> None:

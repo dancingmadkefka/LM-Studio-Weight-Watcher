@@ -1241,16 +1241,22 @@ def _hash_cache_key(path: Path, models_root: Path | None) -> str:
 def prune_hash_cache(
     cache: dict[str, dict[str, Any]], models_root: Path
 ) -> None:
-    """Drop cache entries whose file no longer exists under models_root.
+    """Drop cache entries whose file no longer exists.
 
     Mutates ``cache`` in place so callers that retain their original reference
     (and later save it) persist the surviving entries along with any new hashes
-    computed during the check. Entries keyed by paths outside models_root are
-    left untouched.
+    computed during the check. Existing files outside models_root retain their
+    absolute-path entries.
     """
     for key in list(cache.keys()):
-        if (models_root / key).is_file():
-            continue
+        try:
+            path = Path(key)
+            if key and not (path.drive and not path.root):
+                candidate = path if path.is_absolute() else models_root / path
+                if candidate.is_file():
+                    continue
+        except (OSError, TypeError, ValueError):
+            pass
         del cache[key]
 
 

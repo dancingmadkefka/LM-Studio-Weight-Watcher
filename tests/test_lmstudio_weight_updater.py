@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -15,11 +16,13 @@ from unittest.mock import patch
 from lmstudio_weight_checker import ArtifactResult, CheckResult
 from lmstudio_weight_updater import (
     CancellationToken,
+    HuggingFaceDownloader,
     InstallError,
     IntegrityError,
     MANIFEST_TEMP_RE,
     PlanError,
     UpdateCancelled,
+    UpdateError,
     UpdateExecutor,
     _select_results,
     build_update_plan,
@@ -370,6 +373,205 @@ class ExecutionTests(unittest.TestCase):
         result = check_result(key="model", name="Model", repo="org/repo", artifacts=artifacts)
         plan = build_update_plan([result], models_root=root, safety_reserve_bytes=0)
         return root, plan, contents
+
+    def test_downloader_passes_cache_dir_in_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            seen = {}
+            def fake_download(**kwargs):
+                seen.update(kwargs)
+                artifact.staged_path.write_bytes(contents[artifact.remote_file])
+                return str(artifact.staged_path)
+            with patch("huggingface_hub.hf_hub_download", side_effect=fake_download):
+                HuggingFaceDownloader().download(
+                    artifact, cancellation=CancellationToken(), progress=lambda _done, _total: None
+                )
+            cache = Path(seen["cache_dir"])
+            self.assertTrue(cache.is_relative_to(plan.staging_root))
+            self.assertTrue(cache.is_relative_to(artifact.download_dir))
+            self.assertNotEqual(cache, Path.home() / ".cache" / "huggingface" / "hub")
+
+    def test_downloader_uses_local_dir_and_no_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            seen = {}
+            def fake_download(**kwargs):
+                seen.update(kwargs)
+                artifact.staged_path.write_bytes(contents[artifact.remote_file])
+                return str(artifact.staged_path)
+            cancellation = CancellationToken()
+            with patch("huggingface_hub.hf_hub_download", side_effect=fake_download):
+                HuggingFaceDownloader().download(
+                    artifact, cancellation=cancellation, progress=lambda _done, _total: None
+                )
+            self.assertEqual(seen["local_dir"], str(artifact.download_dir))
+            self.assertFalse(seen["force_download"])
+            tracker = seen["tqdm_class"](total=3, disable=True)
+            cancellation.cancel()
+            with self.assertRaises(UpdateCancelled):
+                tracker.update(1)
+            tracker.close()
+
+    def test_download_path_must_match_staged_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, _contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            wrong = artifact.download_dir / "wrong.gguf"
+            wrong.parent.mkdir(parents=True)
+            wrong.write_bytes(b"new")
+            with patch("huggingface_hub.hf_hub_download", return_value=str(wrong)):
+                with self.assertRaisesRegex(UpdateError, "unexpected staging path"):
+                    HuggingFaceDownloader().download(
+                        artifact, cancellation=CancellationToken(), progress=lambda _done, _total: None
+                    )
+
+    def test_successful_update_reports_no_cleanup_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            metadata = artifact.download_dir / ".cache" / "huggingface" / "metadata"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text("resume", encoding="utf-8")
+            xet_log = artifact.download_dir / ".hf-xet" / "logs" / "xet.log"
+            class CachingDownloader(FakeDownloader):
+                def download(self, current, *, cancellation, progress):
+                    result = super().download(current, cancellation=cancellation, progress=progress)
+                    (current.download_dir / ".cache" / "huggingface" / "new-meta").write_text(
+                        "owned", encoding="utf-8"
+                    )
+                    xet_log.parent.mkdir(parents=True)
+                    xet_log.write_text("local", encoding="utf-8")
+                    return result
+            result = UpdateExecutor(plan, downloader=CachingDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertIn(str(metadata), manifest["owned_staging_files"])
+            self.assertIn(str(xet_log), manifest["owned_staging_files"])
+            self.assertNotIn("Preserved", result.message)
+            self.assertNotIn("Cleanup remains", result.message)
+            self.assertFalse(artifact.download_dir.exists())
+
+    def test_downloader_does_not_touch_global_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            _root, plan, contents = self.make_plan(base, [("model.gguf", b"old", b"new")])
+            profile = base / "profile"
+            profile.mkdir()
+            artifact = plan.artifacts[0]
+            artifact.staged_path.parent.mkdir(parents=True)
+            artifact.staged_path.write_bytes(contents[artifact.remote_file])
+            resume_metadata = artifact.download_dir / ".cache" / "huggingface" / "resume"
+            resume_metadata.parent.mkdir(parents=True)
+            resume_metadata.write_text("complete", encoding="utf-8")
+            downloader = FakeDownloader(contents)
+            with patch("pathlib.Path.home", return_value=profile):
+                result = UpdateExecutor(plan, downloader=downloader).execute(
+                    post_install_validator=lambda _plan: None
+                )
+            self.assertTrue(result.success)
+            self.assertEqual(downloader.calls, [])
+            self.assertFalse(resume_metadata.exists())
+            self.assertEqual(list(profile.rglob("*")), [])
+
+    def test_downloader_scopes_xet_cache_and_restores_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            _root, plan, contents = self.make_plan(base, [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            profile = base / "profile"
+            profile.mkdir()
+            previous = str(profile / "existing-xet-cache")
+            seen = []
+            def fake_download(**kwargs):
+                xet_cache = Path(os.environ["HF_XET_CACHE"])
+                seen.append(xet_cache)
+                log = xet_cache / "logs" / "xet.log"
+                log.parent.mkdir(parents=True)
+                log.write_text("scoped", encoding="utf-8")
+                artifact.staged_path.write_bytes(contents[artifact.remote_file])
+                return str(artifact.staged_path)
+            with (patch.dict(os.environ, {"HF_XET_CACHE": previous}),
+                  patch("pathlib.Path.home", return_value=profile),
+                  patch("huggingface_hub.hf_hub_download", side_effect=fake_download),
+                  patch("huggingface_hub.utils._xet.abort_xet_session", create=True) as abort):
+                HuggingFaceDownloader().download(
+                    artifact, cancellation=CancellationToken(), progress=lambda _done, _total: None
+                )
+                self.assertEqual(os.environ["HF_XET_CACHE"], previous)
+            self.assertEqual(seen, [artifact.download_dir / ".hf-xet"])
+            self.assertTrue((seen[0] / "logs" / "xet.log").exists())
+            self.assertEqual(list(profile.rglob("*")), [])
+            self.assertEqual(abort.call_count, 2)
+
+    def test_downloader_restores_xet_environment_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old", b"one"), ("two.gguf", b"old", b"two")]
+            )
+            first, second = plan.artifacts
+            seen = []
+            def fake_download(**kwargs):
+                seen.append(Path(os.environ["HF_XET_CACHE"]))
+                if kwargs["filename"] == first.remote_file:
+                    raise OSError("network failed")
+                second.staged_path.write_bytes(contents[second.remote_file])
+                return str(second.staged_path)
+            with (patch.dict(os.environ, {"HF_XET_CACHE": "previous-cache"}),
+                  patch("huggingface_hub.hf_hub_download", side_effect=fake_download),
+                  patch("huggingface_hub.utils._xet.abort_xet_session", create=True) as abort):
+                with self.assertRaisesRegex(OSError, "network failed"):
+                    HuggingFaceDownloader().download(
+                        first, cancellation=CancellationToken(), progress=lambda _done, _total: None
+                    )
+                self.assertEqual(os.environ["HF_XET_CACHE"], "previous-cache")
+                HuggingFaceDownloader().download(
+                    second, cancellation=CancellationToken(), progress=lambda _done, _total: None
+                )
+                self.assertEqual(os.environ["HF_XET_CACHE"], "previous-cache")
+            self.assertEqual(seen, [first.download_dir / ".hf-xet", second.download_dir / ".hf-xet"])
+            self.assertEqual(abort.call_count, 4)
+
+    def test_concurrent_downloads_keep_xet_caches_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old", b"one"), ("two.gguf", b"old", b"two")]
+            )
+            by_name = {artifact.remote_file: artifact for artifact in plan.artifacts}
+            seen = {}
+            active = 0
+            highest_active = 0
+            guard = threading.Lock()
+            def fake_download(**kwargs):
+                nonlocal active, highest_active
+                artifact = by_name[kwargs["filename"]]
+                with guard:
+                    active += 1
+                    highest_active = max(highest_active, active)
+                seen[artifact.remote_file] = Path(os.environ["HF_XET_CACHE"])
+                time.sleep(0.02)
+                artifact.staged_path.write_bytes(contents[artifact.remote_file])
+                with guard:
+                    active -= 1
+                return str(artifact.staged_path)
+            with (patch.dict(os.environ, {"HF_XET_CACHE": "previous-cache"}),
+                  patch("huggingface_hub.hf_hub_download", side_effect=fake_download),
+                  patch("huggingface_hub.utils._xet.abort_xet_session", create=True)):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(HuggingFaceDownloader().download, artifact,
+                                           cancellation=CancellationToken(),
+                                           progress=lambda _done, _total: None)
+                               for artifact in plan.artifacts]
+                    for future in futures:
+                        future.result()
+                self.assertEqual(os.environ["HF_XET_CACHE"], "previous-cache")
+            self.assertEqual(highest_active, 1)
+            self.assertEqual(
+                seen, {artifact.remote_file: artifact.download_dir / ".hf-xet"
+                       for artifact in plan.artifacts}
+            )
 
     def test_success_verifies_installs_seeds_cache_and_cleans(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -864,7 +1066,7 @@ class ExecutionTests(unittest.TestCase):
     def test_cleanup_preserves_and_reports_unknown_staging_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
-            marker = plan.artifacts[0].download_dir / "user-note.txt"
+            marker = plan.staging_root / "downloads" / "unrelated" / "user-note.txt"
 
             def validate(_plan):
                 marker.parent.mkdir(parents=True, exist_ok=True)

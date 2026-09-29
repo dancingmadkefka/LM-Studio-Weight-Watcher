@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -41,6 +42,7 @@ MANIFEST_VERSION = 1
 MANIFEST_TEMP_MAX_AGE_SECONDS = 3600
 MANIFEST_TEMP_RE = re.compile(r"^\.job-[0-9a-f]{20}\.json\.[a-z0-9_]{8}\.tmp$")
 STAGING_DIRECTORY_NAME = ".weight-watcher-staging"
+_XET_DOWNLOAD_LOCK = threading.RLock()
 SENSITIVE_QUERY_RE = re.compile(
     r"(?i)([?&](?:x-amz-(?:signature|credential|security-token)|signature|token|access_token|auth)=)[^&\s]+"
 )
@@ -788,6 +790,35 @@ def verify_staged_artifact(
         )
 
 
+@contextmanager
+def _scoped_xet_cache(cache_dir: Path):
+    """Keep Xet's process-wide cache setting tied to one download at a time."""
+    with _XET_DOWNLOAD_LOCK:
+        previous = os.environ.get("HF_XET_CACHE")
+        os.environ["HF_XET_CACHE"] = str(cache_dir)
+        try:
+            try:
+                from huggingface_hub.utils import _xet
+            except ImportError:
+                abort_xet_session = None
+            else:
+                abort_xet_session = getattr(_xet, "abort_xet_session", None)
+
+            # A session created by an earlier download keeps its original cache.
+            if abort_xet_session is not None:
+                abort_xet_session()
+            try:
+                yield
+            finally:
+                if abort_xet_session is not None:
+                    abort_xet_session()
+        finally:
+            if previous is None:
+                os.environ.pop("HF_XET_CACHE", None)
+            else:
+                os.environ["HF_XET_CACHE"] = previous
+
+
 class HuggingFaceDownloader:
     """Lazy Hugging Face downloader with resumable local-dir semantics."""
 
@@ -799,36 +830,38 @@ class HuggingFaceDownloader:
         progress: Callable[[int, int], None],
     ) -> Path:
         cancellation.raise_if_cancelled()
-        try:
-            from huggingface_hub import hf_hub_download
-            from tqdm.auto import tqdm
-        except ImportError as exc:
-            raise UpdateError(
-                "Downloading requires huggingface_hub and hf_xet. "
-                "Install the project's requirements and retry."
-            ) from exc
-
-        token = cancellation
-
-        class ProgressTqdm(tqdm):
-            def update(self, n: int = 1) -> bool | None:
-                token.raise_if_cancelled()
-                changed = super().update(n)
-                progress(int(self.n), int(self.total or artifact.expected_size))
-                return changed
-
-            def close(self) -> None:
-                progress(int(self.n), int(self.total or artifact.expected_size))
-                super().close()
-
         artifact.download_dir.mkdir(parents=True, exist_ok=True)
-        downloaded = hf_hub_download(
-            repo_id=artifact.remote_repo,
-            filename=artifact.remote_file,
-            local_dir=str(artifact.download_dir),
-            force_download=False,
-            tqdm_class=ProgressTqdm,
-        )
+        with _scoped_xet_cache(artifact.download_dir / ".hf-xet"):
+            try:
+                from huggingface_hub import hf_hub_download
+                from tqdm.auto import tqdm
+            except ImportError as exc:
+                raise UpdateError(
+                    "Downloading requires huggingface_hub and hf_xet. "
+                    "Install the project's requirements and retry."
+                ) from exc
+
+            token = cancellation
+
+            class ProgressTqdm(tqdm):
+                def update(self, n: int = 1) -> bool | None:
+                    token.raise_if_cancelled()
+                    changed = super().update(n)
+                    progress(int(self.n), int(self.total or artifact.expected_size))
+                    return changed
+
+                def close(self) -> None:
+                    progress(int(self.n), int(self.total or artifact.expected_size))
+                    super().close()
+
+            downloaded = hf_hub_download(
+                repo_id=artifact.remote_repo,
+                filename=artifact.remote_file,
+                local_dir=str(artifact.download_dir),
+                cache_dir=str(artifact.download_dir / ".hf-cache"),
+                force_download=False,
+                tqdm_class=ProgressTqdm,
+            )
         path = Path(downloaded).resolve()
         expected = artifact.staged_path.resolve(strict=False)
         if path != expected:
@@ -916,26 +949,36 @@ class UpdateExecutor:
         try:
             for artifact in self.plan.artifacts:
                 self.cancellation.raise_if_cancelled()
+                download_root = artifact.download_dir.resolve(strict=False)
+                owned_staging_files.update(
+                    path for path in _files_under(artifact.download_dir)
+                    if path.is_relative_to(download_root)
+                )
+                write_manifest(
+                    self.plan, "downloading", owned_staging_files=owned_staging_files
+                )
                 if not artifact.staged_path.is_file() or artifact.staged_path.stat().st_size != artifact.expected_size:
                     self._emit("downloading", f"Downloading {artifact.label}", artifact=artifact)
-                    before = _files_under(artifact.download_dir)
-                    self.downloader.download(
-                        artifact,
-                        cancellation=self.cancellation,
-                        progress=lambda done, total, current=artifact: self._emit(
-                            "downloading",
-                            f"Downloading {current.label}",
-                            artifact=current,
-                            completed=done,
-                            total=total,
-                        ),
-                    )
-                    owned_staging_files.update(_files_under(artifact.download_dir) - before)
-                    write_manifest(
-                        self.plan,
-                        "downloading",
-                        owned_staging_files=owned_staging_files,
-                    )
+                    try:
+                        self.downloader.download(
+                            artifact,
+                            cancellation=self.cancellation,
+                            progress=lambda done, total, current=artifact: self._emit(
+                                "downloading",
+                                f"Downloading {current.label}",
+                                artifact=current,
+                                completed=done,
+                                total=total,
+                            ),
+                        )
+                    finally:
+                        owned_staging_files.update(
+                            path for path in _files_under(artifact.download_dir)
+                            if path.is_relative_to(download_root)
+                        )
+                        write_manifest(
+                            self.plan, "downloading", owned_staging_files=owned_staging_files
+                        )
                 self._emit("verifying", f"Verifying {artifact.label}", artifact=artifact)
                 verify_staged_artifact(
                     artifact,
@@ -1240,6 +1283,15 @@ class UpdateExecutor:
                             f"{artifact.download_dir}."
                         )
         downloads = self.plan.staging_root / "downloads"
+        unknown_outside_job = {
+            path for path in _files_under(downloads)
+            if not any(path.is_relative_to(artifact.download_dir.resolve(strict=False))
+                       for artifact in self.plan.artifacts)
+        }
+        if unknown_outside_job:
+            warnings.append(
+                f"Preserved {len(unknown_outside_job)} unknown staging file(s) outside this job's download directories."
+            )
         if downloads.is_dir() and not any(downloads.iterdir()):
             downloads.rmdir()
         if remove_manifest and not warnings and self.plan.manifest_path.is_file():

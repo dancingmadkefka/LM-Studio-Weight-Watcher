@@ -647,10 +647,6 @@ def get_remote_file_metadata(
     Raises ``CheckerError`` when a request failed transiently, so the caller
     can avoid mistaking a network/auth failure for a removal.
     """
-    search_paths = [""]
-    if "/" in remote_file:
-        search_paths.append(remote_file.rsplit("/", 1)[0])
-
     had_error = False
     repo_confirmed_gone = False
     revision_error: DefaultRevisionError | None = None
@@ -659,10 +655,18 @@ def get_remote_file_metadata(
     if isinstance(cached_error, (DefaultRevisionError, RemoteFileMissing)):
         raise cached_error
 
-    def fetch_into_cache(key: tuple[str, str], parent: str) -> None:
+    def fetch_into_cache(parent: str) -> bool:
         nonlocal had_error, repo_confirmed_gone, revision_error
+        key = (repo, parent)
+        status_key = (repo, f"\0tree-status:{parent}")
         if key in tree_cache:
-            return
+            if status_key in tree_cache:
+                if tree_cache[status_key].get("repo_gone"):
+                    repo_confirmed_gone = True
+                else:
+                    had_error = True
+                return False
+            return True
         try:
             token = _ACTIVE_TREE_CACHE.set(tree_cache)
             try:
@@ -678,35 +682,57 @@ def get_remote_file_metadata(
                     had_error = True
                 else:
                     repo_confirmed_gone = True
+            else:
+                had_error = True
             tree_cache[key] = {}
+            tree_cache[status_key] = {"repo_gone": repo_confirmed_gone}
+            return False
         except DefaultRevisionError as exc:
             revision_error = exc
             tree_cache[key] = {}
+            tree_cache[status_key] = {"failed": True}
+            return False
         except CheckerError:
             # Transient failure. Record an empty entry so subsequent lookups in
             # this run don't KeyError, but keep the flag so the final verdict is
             # "unresolved" rather than a false "removed".
             had_error = True
             tree_cache[key] = {}
+            tree_cache[status_key] = {"failed": True}
+            return False
+        return True
 
-    for parent in search_paths:
-        cache_key = (repo, parent)
-        fetch_into_cache(cache_key, parent)
-        file_entry = tree_cache[cache_key].get(remote_file)
-        if file_entry:
-            return file_entry
+    # Walk listings from the root. A failed directory request is not proof
+    # that any file below it has been removed.
+    confirmed_absent = False
+    root_listed = fetch_into_cache("")
+    if root_listed:
+        parent = ""
+        parts = remote_file.split("/")
+        for part in parts[:-1]:
+            child = f"{parent}/{part}" if parent else part
+            if child not in tree_cache[(repo, parent)]:
+                confirmed_absent = True
+                break
+            if not fetch_into_cache(child):
+                break
+            parent = child
+        else:
+            file_entry = tree_cache[(repo, parent)].get(remote_file)
+            if file_entry:
+                return file_entry
+            confirmed_absent = True
 
     # If still not found, try a flat search of the entire repo (first level folders)
     # This helps when the file is in a folder like 'IQ4_XS' but the path is flat.
     bare_name = remote_file.rsplit("/", 1)[-1] if "/" in remote_file else remote_file
-    root_key = (repo, "")
-    fetch_into_cache(root_key, "")
-
-    for entry in tree_cache[root_key].values():
-        if entry.get("type") == "directory":
+    for entry in tree_cache[(repo, "")].values():
+        if isinstance(entry, dict) and entry.get("type") == "directory":
             dir_name = entry["path"]
             dir_key = (repo, dir_name)
-            fetch_into_cache(dir_key, dir_name)
+            if not fetch_into_cache(dir_name):
+                had_error = True
+                continue
             file_entry = tree_cache[dir_key].get(f"{dir_name}/{bare_name}")
             if file_entry:
                 return file_entry
@@ -717,12 +743,14 @@ def get_remote_file_metadata(
         raise revision_error
     if had_error:
         raise CheckerError(
-            f"Could not confirm remote status of {repo}/{remote_file} "
+            f"could not confirm remote status of {repo}/{remote_file} "
             "(a Hugging Face request failed)."
         )
-    raise RemoteFileMissing(
-        f"Could not find remote file metadata for {repo}/{remote_file}."
-    )
+    if confirmed_absent:
+        raise RemoteFileMissing(
+            f"Could not find remote file metadata for {repo}/{remote_file}."
+        )
+    raise CheckerError(f"could not confirm remote status of {repo}/{remote_file}.")
 
 
 def _default_revision(repo: str, timeout_seconds: int) -> str:

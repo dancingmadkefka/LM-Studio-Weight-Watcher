@@ -668,6 +668,128 @@ class RemoteFailureClassificationTests(unittest.TestCase):
         self.assertIn("could not reach Hugging Face", result.message)
 
 
+class RemovalProofTests(unittest.TestCase):
+    REPO = "tester/test-model"
+    FILE = "quants/Model-Q4_K_M.gguf"
+
+    def _check(self, trees, remote_file=None):
+        remote_file = remote_file or self.FILE
+        calls = []
+
+        def fake_fetch_tree(repo, parent, timeout):
+            self.assertEqual(repo, self.REPO)
+            calls.append(parent)
+            value = trees[parent]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "Model-Q4_K_M.gguf"
+            local.write_bytes(b"local")
+            artifact = Artifact("weight", "weights", local, self.REPO, remote_file)
+            with patch("lmstudio_weight_checker.fetch_tree", side_effect=fake_fetch_tree):
+                result = compare_artifact(
+                    artifact, timeout_seconds=5, tree_cache={}, hash_cache={},
+                )
+        return result, calls
+
+    @staticmethod
+    def _directory(path):
+        return {"type": "directory", "path": path}
+
+    @staticmethod
+    def _file(path):
+        entry = remote_entry(oid=hashlib.sha256(b"local").hexdigest(), size=5)
+        entry["path"] = path
+        return entry
+
+    def test_parent_directory_404_is_unresolved_not_removed(self):
+        result, _ = self._check({
+            "": {"quants": self._directory("quants")},
+            "quants": RemoteFileMissing("directory 404"),
+        })
+        self.assertEqual(result.status, "unresolved")
+        self.assertIn("could not confirm remote status", result.message)
+        self.assertNotIn("removed from Hugging Face", result.message)
+
+    def test_root_404_is_removed(self):
+        result, _ = self._check({"": RemoteFileMissing("repo 404")})
+        self.assertEqual(result.status, "removed-remote")
+
+    def test_file_absent_from_listed_parent_is_removed(self):
+        result, _ = self._check({
+            "": {"quants": self._directory("quants")},
+            "quants": {"quants/other.gguf": self._file("quants/other.gguf")},
+        })
+        self.assertEqual(result.status, "removed-remote")
+
+    def test_parent_absent_from_listed_root_is_removed(self):
+        result, calls = self._check({"": {}})
+        self.assertEqual(result.status, "removed-remote")
+        self.assertEqual(calls, [""])
+
+    def test_nested_parent_is_checked_from_root(self):
+        result, calls = self._check({
+            "": {"quants": self._directory("quants")},
+            "quants": {"quants/large": self._directory("quants/large")},
+            "quants/large": {},
+        }, remote_file="quants/large/Model-Q4_K_M.gguf")
+        self.assertEqual(result.status, "removed-remote")
+        self.assertEqual(calls, ["", "quants", "quants/large"])
+
+    def test_flat_scan_finds_moved_file(self):
+        moved = "other/Model-Q4_K_M.gguf"
+        result, _ = self._check({
+            "": {"other": self._directory("other")},
+            "other": {moved: self._file(moved)},
+        })
+        self.assertEqual(result.status, "up-to-date")
+
+    def test_no_suggestions_when_absence_unconfirmed(self):
+        result, _ = self._check({
+            "": {"quants": self._directory("quants")},
+            "quants": RemoteFileMissing("directory 404"),
+        })
+        self.assertEqual(result.status, "unresolved")
+        self.assertFalse(result.suggestions)
+
+    def test_suggestions_when_absence_confirmed(self):
+        alternative = "quants/Model-Q8_0.gguf"
+        result, _ = self._check({
+            "": {"quants": self._directory("quants")},
+            "quants": {alternative: self._file(alternative)},
+        })
+        self.assertEqual(result.status, "removed-remote")
+        self.assertIn("Model-Q8_0.gguf", result.suggestions)
+
+    def test_failed_flat_scan_does_not_prove_absence(self):
+        result, _ = self._check({
+            "": {"other": self._directory("other")},
+            "other": CheckerError("timeout"),
+        })
+        self.assertEqual(result.status, "unresolved")
+
+    def test_cached_parent_404_stays_unresolved(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "Model-Q4_K_M.gguf"
+            local.write_bytes(b"local")
+            cache = {}
+
+            def fake_fetch_tree(repo, parent, timeout):
+                if parent == "":
+                    return {"quants": self._directory("quants")}
+                raise RemoteFileMissing("directory 404")
+
+            with patch("lmstudio_weight_checker.fetch_tree", side_effect=fake_fetch_tree):
+                for _ in range(2):
+                    result = compare_artifact(
+                        Artifact("weight", "weights", local, self.REPO, self.FILE),
+                        timeout_seconds=5, tree_cache=cache, hash_cache={},
+                    )
+                    self.assertEqual(result.status, "unresolved")
+
+
 class ShardAndNestedPathTests(unittest.TestCase):
     """P2: missing shards must be detected; nested remote paths preserved."""
 

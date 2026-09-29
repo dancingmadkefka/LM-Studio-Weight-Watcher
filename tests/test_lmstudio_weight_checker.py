@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -493,6 +496,132 @@ class RemoteFailureClassificationTests(unittest.TestCase):
             kind="weight", label="weights", local_path=path,
             remote_repo=self.REPO, remote_file="test.gguf",
         )
+
+    def test_default_branch_other_than_main_is_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "test.gguf"
+            local.write_bytes(b"local")
+            urls = []
+
+            def fake_fetch_json(url, timeout):
+                urls.append(url)
+                if url.endswith("/tester/test-model"):
+                    return {"defaultBranch": "master"}
+                if "/tree/master?" in url:
+                    item = remote_entry(oid=hashlib.sha256(b"local").hexdigest(), size=5)
+                    item["path"] = "test.gguf"
+                    return [item]
+                raise AssertionError(f"Unexpected URL: {url}")
+
+            with patch("lmstudio_weight_checker.fetch_json", side_effect=fake_fetch_json):
+                result = compare_artifact(
+                    self._artifact(local), timeout_seconds=5, tree_cache={}, hash_cache={}
+                )
+            self.assertEqual(result.status, "up-to-date")
+            self.assertTrue(any("/tree/master?" in url for url in urls))
+
+    def test_default_branch_metadata_is_cached_per_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = {}
+            metadata_calls = 0
+
+            def fake_fetch_json(url, timeout):
+                nonlocal metadata_calls
+                if url.endswith("/tester/test-model"):
+                    metadata_calls += 1
+                    return {"defaultBranch": "master"}
+                items = []
+                for index in range(3):
+                    item = remote_entry(oid=hashlib.sha256(bytes([index])).hexdigest(), size=1)
+                    item["path"] = f"part{index}.gguf"
+                    items.append(item)
+                return items
+
+            with patch("lmstudio_weight_checker.fetch_json", side_effect=fake_fetch_json):
+                for index in range(3):
+                    local = Path(tmpdir) / f"part{index}.gguf"
+                    local.write_bytes(bytes([index]))
+                    result = compare_artifact(
+                        Artifact("weight", f"part{index}", local, self.REPO, local.name),
+                        timeout_seconds=5, tree_cache=cache, hash_cache={},
+                    )
+                    self.assertEqual(result.status, "up-to-date")
+            self.assertEqual(metadata_calls, 1)
+
+    def test_metadata_failure_is_unresolved_not_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "test.gguf"
+            local.write_bytes(b"local")
+            cache = {}
+            with patch("lmstudio_weight_checker.fetch_json", side_effect=CheckerError("metadata timeout")):
+                first = compare_artifact(self._artifact(local), timeout_seconds=5, tree_cache=cache, hash_cache={})
+                second = compare_artifact(self._artifact(local), timeout_seconds=5, tree_cache=cache, hash_cache={})
+            for result in (first, second):
+                self.assertEqual(result.status, "unresolved")
+                self.assertIn("default revision", result.message)
+                self.assertNotIn("removed", result.message)
+
+    def test_metadata_without_valid_revision_is_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "test.gguf"
+            local.write_bytes(b"local")
+            with patch("lmstudio_weight_checker.fetch_json", return_value={"sha": "bad"}) as fetch:
+                result = compare_artifact(self._artifact(local), timeout_seconds=5, tree_cache={}, hash_cache={})
+            self.assertEqual(result.status, "unresolved")
+            self.assertIn("default revision", result.message)
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_tree_404_after_valid_metadata_is_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "test.gguf"
+            local.write_bytes(b"local")
+            with patch(
+                "lmstudio_weight_checker.fetch_json",
+                side_effect=[{"defaultBranch": "master"}, RemoteFileMissing("revision missing")],
+            ):
+                result = compare_artifact(self._artifact(local), timeout_seconds=5, tree_cache={}, hash_cache={})
+            self.assertEqual(result.status, "unresolved")
+
+    def test_repo_missing_still_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "test.gguf"
+            local.write_bytes(b"local")
+            with patch("lmstudio_weight_checker.fetch_json", side_effect=RemoteFileMissing("repo gone")):
+                result = compare_artifact(self._artifact(local), timeout_seconds=5, tree_cache={}, hash_cache={})
+            self.assertEqual(result.status, "removed-remote")
+
+    def test_listed_tree_without_file_still_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "test.gguf"
+            local.write_bytes(b"local")
+            with patch("lmstudio_weight_checker.fetch_json", side_effect=[{"defaultBranch": "master"}, []]):
+                result = compare_artifact(self._artifact(local), timeout_seconds=5, tree_cache={}, hash_cache={})
+            self.assertEqual(result.status, "removed-remote")
+
+    def test_metadata_request_uses_token_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / "test.gguf"
+            local.write_bytes(b"local")
+            calls = []
+
+            def fake_urlopen(request, timeout):
+                calls.append((request.full_url, request.get_header("Authorization"), timeout))
+                if request.full_url.endswith("/tester/test-model"):
+                    return io.BytesIO(json.dumps({"sha": "a" * 40}).encode("utf-8"))
+                item = remote_entry(oid=hashlib.sha256(b"local").hexdigest(), size=5)
+                item["path"] = "test.gguf"
+                return io.BytesIO(json.dumps([item]).encode("utf-8"))
+
+            with (
+                patch.dict(os.environ, {"HF_TOKEN": "test-token"}),
+                patch("lmstudio_weight_checker.urllib.request.urlopen", side_effect=fake_urlopen),
+            ):
+                result = compare_artifact(self._artifact(local), timeout_seconds=7, tree_cache={}, hash_cache={})
+            self.assertEqual(result.status, "up-to-date")
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[0][0].endswith("/tester/test-model"))
+            self.assertEqual(calls[0][1], "Bearer test-token")
+            self.assertEqual(calls[0][2], 7)
 
     def test_confirmed_missing_tree_is_removed_remote(self) -> None:
         # Tree fetched successfully but file absent -> genuine removal.

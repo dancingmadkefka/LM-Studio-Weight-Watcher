@@ -11,6 +11,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,10 @@ from typing import Any
 DEFAULT_TIMEOUT_SECONDS = 30
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
 HF_API_ROOT = "https://huggingface.co/api/models"
+_REVISION_CACHE_KEY = "\0default-revision"
+_ACTIVE_TREE_CACHE: ContextVar[dict[tuple[str, str], dict[str, Any]] | None] = ContextVar(
+    "active_tree_cache", default=None
+)
 
 # Matches a sharded GGUF, e.g. "Model-Q4_K-00001-of-00002.gguf".
 SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
@@ -182,6 +187,10 @@ class RemoteFileMissing(CheckerError):
     successfully listed) qualifies, so the caller can safely classify it as
     ``removed-remote`` instead of a transient ``unresolved``.
     """
+
+
+class DefaultRevisionError(CheckerError):
+    """The repository exists, but its default revision is unknown."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -644,18 +653,34 @@ def get_remote_file_metadata(
 
     had_error = False
     repo_confirmed_gone = False
+    revision_error: DefaultRevisionError | None = None
+    cached_revision = tree_cache.get((repo, _REVISION_CACHE_KEY), {})
+    cached_error = cached_revision.get("error")
+    if isinstance(cached_error, (DefaultRevisionError, RemoteFileMissing)):
+        raise cached_error
 
     def fetch_into_cache(key: tuple[str, str], parent: str) -> None:
-        nonlocal had_error, repo_confirmed_gone
+        nonlocal had_error, repo_confirmed_gone, revision_error
         if key in tree_cache:
             return
         try:
-            tree_cache[key] = fetch_tree(repo, parent, timeout_seconds)
+            token = _ACTIVE_TREE_CACHE.set(tree_cache)
+            try:
+                tree_cache[key] = fetch_tree(repo, parent, timeout_seconds)
+            finally:
+                _ACTIVE_TREE_CACHE.reset(token)
         except RemoteFileMissing:
             # 404 on a tree endpoint. The repo root being gone means every
-            # file in it is gone; a missing subdir is not conclusive on its own.
+            # file in it is gone only when metadata did not establish a repo.
+            # A stale default revision must not look like repository removal.
             if parent == "":
-                repo_confirmed_gone = True
+                if "revision" in tree_cache.get((repo, _REVISION_CACHE_KEY), {}):
+                    had_error = True
+                else:
+                    repo_confirmed_gone = True
+            tree_cache[key] = {}
+        except DefaultRevisionError as exc:
+            revision_error = exc
             tree_cache[key] = {}
         except CheckerError:
             # Transient failure. Record an empty entry so subsequent lookups in
@@ -688,6 +713,8 @@ def get_remote_file_metadata(
 
     if repo_confirmed_gone:
         raise RemoteFileMissing(f"Repository removed on Hugging Face: {repo}")
+    if revision_error:
+        raise revision_error
     if had_error:
         raise CheckerError(
             f"Could not confirm remote status of {repo}/{remote_file} "
@@ -698,13 +725,62 @@ def get_remote_file_metadata(
     )
 
 
+def _default_revision(repo: str, timeout_seconds: int) -> str:
+    cache = _ACTIVE_TREE_CACHE.get()
+    key = (repo, _REVISION_CACHE_KEY)
+    if cache is not None and key in cache:
+        entry = cache[key]
+        if "error" in entry:
+            raise entry["error"]
+        return str(entry["revision"])
+
+    repo_part = urllib.parse.quote(repo, safe="/")
+    try:
+        payload = fetch_json(f"{HF_API_ROOT}/{repo_part}", timeout_seconds)
+    except RemoteFileMissing as exc:
+        if cache is not None:
+            cache[key] = {"error": exc}
+        raise
+    except CheckerError as exc:
+        error = DefaultRevisionError(
+            f"Could not determine the default revision for {repo}: {exc}"
+        )
+        if cache is not None:
+            cache[key] = {"error": error}
+        raise error from exc
+
+    revision = None
+    from_sha = False
+    if isinstance(payload, dict):
+        revision = payload.get("defaultBranch") or payload.get("default_branch")
+        if not revision:
+            revision = payload.get("sha")
+            from_sha = True
+    if (
+        not isinstance(revision, str)
+        or not revision.strip()
+        or revision != revision.strip()
+        or (from_sha and not re.fullmatch(r"[0-9a-fA-F]{40}", revision))
+    ):
+        error = DefaultRevisionError(
+            f"Could not determine the default revision for {repo}: metadata has no revision."
+        )
+        if cache is not None:
+            cache[key] = {"error": error}
+        raise error
+    if cache is not None:
+        cache[key] = {"revision": revision}
+    return revision
+
+
 def fetch_tree(repo: str, parent: str, timeout_seconds: int) -> dict[str, Any]:
     repo_part = urllib.parse.quote(repo, safe="/")
+    revision = urllib.parse.quote(_default_revision(repo, timeout_seconds), safe="")
     if parent:
         parent_part = urllib.parse.quote(parent, safe="/")
-        url = f"{HF_API_ROOT}/{repo_part}/tree/main/{parent_part}?expand=true"
+        url = f"{HF_API_ROOT}/{repo_part}/tree/{revision}/{parent_part}?expand=true"
     else:
-        url = f"{HF_API_ROOT}/{repo_part}/tree/main?expand=true"
+        url = f"{HF_API_ROOT}/{repo_part}/tree/{revision}?expand=true"
 
     payload = fetch_json(url, timeout_seconds)
     if not isinstance(payload, list):
@@ -802,6 +878,14 @@ def compare_artifact(
         )
     except RemoteFileMissing:
         remote = None
+    except DefaultRevisionError as exc:
+        return result(
+            "unresolved",
+            local_size=local_size,
+            local_oid=None,
+            local_path=local_path_str,
+            message=f"{artifact.label}: could not determine the repository's default revision ({exc}).",
+        )
     except CheckerError as exc:
         # Transient failure (timeout, auth, network). Must NOT be treated as a
         # removal -- report unresolved so the user is not misled into acting.

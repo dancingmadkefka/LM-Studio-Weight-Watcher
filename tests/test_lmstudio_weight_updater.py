@@ -390,6 +390,99 @@ class ExecutionTests(unittest.TestCase):
         )
         return build_update_plan([result], models_root=root, safety_reserve_bytes=0)
 
+    def test_manifest_records_phase_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            observed = []
+
+            def observe_move(source, destination):
+                phase = json.loads(plan.manifest_path.read_text(encoding="utf-8"))["phase"]
+                observed.append((Path(source), Path(destination), phase))
+                os.replace(source, destination)
+
+            def validate(_plan):
+                phase = json.loads(plan.manifest_path.read_text(encoding="utf-8"))["phase"]
+                self.assertEqual(phase, "validating")
+
+            UpdateExecutor(
+                plan, downloader=FakeDownloader(contents), replace_file=observe_move
+            ).execute(post_install_validator=validate)
+            self.assertEqual(observed[0],
+                             (artifact.destination, artifact.backup_path, "installing"))
+            self.assertEqual(observed[1],
+                             (artifact.staged_path, artifact.destination, "installing"))
+
+    def test_failed_install_records_recovery_phase_before_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old-one", b"new-one"),
+                            ("two.gguf", b"old-two", b"new-two")]
+            )
+            first, second = plan.artifacts
+            observed_rollback = []
+
+            def fail_second_install(source, destination):
+                source, destination = Path(source), Path(destination)
+                if source == second.staged_path and destination == second.destination:
+                    raise OSError("install failed")
+                if source == first.destination and destination == first.staged_path.with_name(
+                    first.staged_path.name + ".rollback"
+                ):
+                    observed_rollback.append(
+                        json.loads(plan.manifest_path.read_text(encoding="utf-8"))["phase"]
+                    )
+                os.replace(source, destination)
+
+            with self.assertRaisesRegex(InstallError, "install failed"):
+                UpdateExecutor(
+                    plan, downloader=FakeDownloader(contents), replace_file=fail_second_install
+                ).execute(post_install_validator=lambda _plan: None)
+            self.assertEqual(observed_rollback, ["rolling-back"])
+
+    def test_rollback_failure_is_not_caught_by_install_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old-one", b"new-one"),
+                            ("two.gguf", b"old-two", b"new-two")]
+            )
+            first, second = plan.artifacts
+
+            def fail_install_and_rollback(source, destination):
+                source, destination = Path(source), Path(destination)
+                if source == second.staged_path and destination == second.destination:
+                    raise OSError("install failed")
+                if source == first.backup_path and destination == first.destination:
+                    raise OSError("rollback failed")
+                os.replace(source, destination)
+
+            with self.assertRaisesRegex(InstallError, "rollback failed"):
+                UpdateExecutor(
+                    plan, downloader=FakeDownloader(contents),
+                    replace_file=fail_install_and_rollback,
+                ).execute(post_install_validator=lambda _plan: None)
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["phase"], "recovery-required")
+
+    def test_execute_writes_manifest_only_through_helper(self) -> None:
+        import lmstudio_weight_updater as updater
+
+        tree = ast.parse(Path(updater.__file__).read_text(encoding="utf-8"))
+        executor = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                        and node.name == "UpdateExecutor")
+        execute = next(node for node in executor.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "execute")
+        helper = next(node for node in executor.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_write_phase_manifest")
+        self.assertFalse(any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "write_manifest" for node in ast.walk(execute)
+        ))
+        self.assertEqual(sum(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "write_manifest" for node in ast.walk(helper)
+        ), 1)
+
     def test_shared_run_returns_result_and_fresh_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])

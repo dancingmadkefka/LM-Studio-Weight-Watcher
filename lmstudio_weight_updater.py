@@ -929,6 +929,14 @@ class HuggingFaceDownloader:
         return path
 
 
+@dataclass
+class _ExecutionState:
+    owned_staging_files: set[Path]
+    installed: list[tuple[UpdateArtifact, bool]] = field(default_factory=list)
+    pending_install: tuple[UpdateArtifact, bool] | None = None
+    hash_cache_snapshot: dict[str, dict[str, Any]] | None = None
+
+
 class UpdateExecutor:
     def __init__(
         self,
@@ -996,222 +1004,25 @@ class UpdateExecutor:
                 raise InstallError(
                     f"Previous backup cleanup is still pending: {self.plan.manifest_path}"
                 )
-        installed: list[tuple[UpdateArtifact, bool]] = []
-        pending_install: tuple[UpdateArtifact, bool] | None = None
-        owned_staging_files = self._load_owned_staging_files()
-        hash_cache_snapshot = None
-        write_manifest(
-            self.plan, "downloading", owned_staging_files=owned_staging_files
-        )
+        state = _ExecutionState(self._load_owned_staging_files())
+        self._write_phase_manifest(state, "downloading")
         try:
-            xet_checked = False
-            for artifact in self.plan.artifacts:
-                self.cancellation.raise_if_cancelled()
-                download_root = artifact.download_dir.resolve(strict=False)
-                owned_staging_files.update(
-                    path for path in _files_under(artifact.download_dir)
-                    if path.is_relative_to(download_root)
-                )
-                write_manifest(
-                    self.plan, "downloading", owned_staging_files=owned_staging_files
-                )
-                if not artifact.staged_path.is_file() or artifact.staged_path.stat().st_size != artifact.expected_size:
-                    if not xet_checked:
-                        available, reason = check_xet_acceleration(
-                            artifact.download_dir / ".hf-xet"
-                        )
-                        xet_checked = True
-                        if not available:
-                            self._emit(
-                                "downloading",
-                                f"Xet acceleration unavailable ({reason}); transfers will use the slower HTTP path.",
-                            )
-                    self._emit("downloading", f"Downloading {artifact.label}", artifact=artifact)
-                    try:
-                        self.downloader.download(
-                            artifact,
-                            cancellation=self.cancellation,
-                            progress=lambda done, total, current=artifact: self._emit(
-                                "downloading",
-                                f"Downloading {current.label}",
-                                artifact=current,
-                                completed=done,
-                                total=total,
-                            ),
-                        )
-                    finally:
-                        owned_staging_files.update(
-                            path for path in _files_under(artifact.download_dir)
-                            if path.is_relative_to(download_root)
-                        )
-                        write_manifest(
-                            self.plan, "downloading", owned_staging_files=owned_staging_files
-                        )
-                self._emit("verifying", f"Verifying {artifact.label}", artifact=artifact)
-                verify_staged_artifact(
-                    artifact,
-                    cancellation=self.cancellation,
-                    progress=lambda done, total, current=artifact: self._emit(
-                        "verifying",
-                        f"Verifying {current.label}",
-                        artifact=current,
-                        completed=done,
-                        total=total,
-                    ),
-                )
-                marker = _verification_marker_path(artifact.staged_path)
-                if marker.is_file():
-                    owned_staging_files.add(marker)
-                    write_manifest(
-                        self.plan, "downloading", owned_staging_files=owned_staging_files
-                    )
-
-            self._emit(
-                "installing",
-                "Installing verified artifacts",
-                total=len(self.plan.artifacts),
-                cancellable=False,
-            )
-            # Publish the non-cancellable boundary synchronously before the
-            # final cancellation check. A cancellation that already won still
-            # aborts here; otherwise observers know shutdown must defer before
-            # any manifest/install filesystem mutation begins.
-            self.cancellation.raise_if_cancelled()
-            write_manifest(
-                self.plan, "installing", owned_staging_files=owned_staging_files
-            )
-            for index, artifact in enumerate(self.plan.artifacts, start=1):
-                artifact.destination.parent.mkdir(parents=True, exist_ok=True)
-                if artifact.backup_path.exists():
-                    raise InstallError(
-                        f"Rollback path already exists; recovery is required: {artifact.backup_path}"
-                    )
-                had_original = artifact.destination.exists()
-                pending_install = (artifact, had_original)
-                try:
-                    if had_original:
-                        self._replace_file(artifact.destination, artifact.backup_path)
-                    self._replace_file(artifact.staged_path, artifact.destination)
-                except OSError as exc:
-                    if had_original and artifact.backup_path.exists() and not artifact.destination.exists():
-                        try:
-                            self._replace_file(artifact.backup_path, artifact.destination)
-                        except OSError as restore_exc:
-                            raise _RestoreFailure(
-                                f"Could not restore {artifact.destination} from "
-                                f"{artifact.backup_path} after install failed: {exc}; "
-                                f"restore failed: {restore_exc}"
-                            ) from restore_exc
-                        pending_install = None
-                    if isinstance(exc, PermissionError):
-                        raise InstallError(
-                            f"Model file is in use: {artifact.destination}. "
-                            "Unload the model in LM Studio and retry."
-                        ) from exc
-                    raise InstallError(f"Could not install {artifact.destination}: {exc}") from exc
-                installed.append((artifact, had_original))
-                pending_install = None
-                self._emit(
-                    "installing",
-                    f"Installed {artifact.label}",
-                    artifact=artifact,
-                    completed=index,
-                    total=len(self.plan.artifacts),
-                    cancellable=False,
-                )
-
-            write_manifest(
-                self.plan, "validating", owned_staging_files=owned_staging_files
-            )
-            self._emit("validating", "Running post-install model check", cancellable=False)
-            if self.hash_cache is not None:
-                hash_cache_snapshot = {
-                    key: dict(value) if isinstance(value, dict) else value
-                    for key, value in self.hash_cache.items()
-                }
-                for artifact in self.plan.artifacts:
-                    cache_verified_oid(
-                        artifact.destination,
-                        artifact.expected_sha256,
-                        self.hash_cache,
-                        models_root=self.plan.models_root,
-                    )
-            post_install_validator(self.plan)
-
-            retained = [
-                artifact.backup_path
-                for artifact, had_original in installed
-                if had_original and artifact.backup_path.is_file()
-            ]
-            backups = [str(path) for path in retained] if self.keep_backups else []
-            cleanup_warnings: list[str] = []
-            completion_phase = (
-                "completed-backups-kept" if self.keep_backups and retained
-                else "completed-cleanup-pending" if retained
-                else "completed"
-            )
-
-            try:
-                write_manifest(
-                    self.plan,
-                    completion_phase,
-                    owned_staging_files=owned_staging_files,
-                    retained_backups=retained,
-                    keep_backups=self.keep_backups,
-                )
-                cleanup_warnings.extend(
-                    self._cleanup_staging(
-                        owned_staging_files,
-                        remove_manifest=not retained,
-                    )
-                )
-                if cleanup_warnings:
-                    write_manifest(
-                        self.plan,
-                        completion_phase if retained else "completed-cleanup-pending",
-                        error="; ".join(cleanup_warnings),
-                        owned_staging_files=owned_staging_files,
-                        retained_backups=retained,
-                        keep_backups=self.keep_backups,
-                    )
-            except OSError as exc:
-                cleanup_warnings.append(f"Could not fully clean staging data: {exc}")
-                try:
-                    write_manifest(
-                        self.plan,
-                        completion_phase if retained else "completed-cleanup-pending",
-                        error="; ".join(cleanup_warnings),
-                        owned_staging_files=owned_staging_files,
-                        retained_backups=retained,
-                        keep_backups=self.keep_backups,
-                    )
-                except OSError:
-                    pass
-            self._emit("completed", "Update completed", cancellable=False)
-            message = "All selected artifacts were updated and verified."
-            if cleanup_warnings:
-                message += " Cleanup remains: " + "; ".join(cleanup_warnings)
-            return UpdateResult(
-                job_id=self.plan.job_id,
-                success=True,
-                updated_paths=tuple(str(a.destination) for a in self.plan.artifacts),
-                backup_paths=tuple(backups),
-                completed_at_utc=format_utc(datetime.now(timezone.utc)),
-                message=message,
-            )
+            self._stage_artifacts(state)
+            self._install_artifacts(state)
+            self._validate_artifacts(state, post_install_validator)
+            return self._finalize_artifacts(state)
         except UpdateCancelled as exc:
-            write_manifest(
-                self.plan,
+            self._write_phase_manifest(
+                state,
                 "cancelled",
                 error=str(exc),
-                owned_staging_files=owned_staging_files,
             )
             self._emit("cancelled", str(exc), cancellable=False)
             raise
         except Exception as exc:
             rollback_status: list[dict[str, Any]] = []
-            if pending_install is not None:
-                artifact, had_original = pending_install
+            if state.pending_install is not None:
+                artifact, had_original = state.pending_install
                 if isinstance(exc, _RestoreFailure):
                     rollback_status.append({
                         "destination": str(artifact.destination),
@@ -1221,38 +1032,247 @@ class UpdateExecutor:
                 elif artifact.backup_path.exists() or (
                     not had_original and artifact.destination.exists() and not artifact.staged_path.exists()
                 ):
-                    installed.append(pending_install)
-            if installed:
-                write_manifest(
-                    self.plan,
+                    state.installed.append(state.pending_install)
+            if state.installed:
+                self._write_phase_manifest(
+                    state,
                     "rolling-back",
                     error=str(exc),
-                    owned_staging_files=owned_staging_files,
                 )
-                rollback_errors, completed_status = self._rollback(installed)
+                rollback_errors, completed_status = self._rollback(state.installed)
                 rollback_status.extend(completed_status)
-                if hash_cache_snapshot is not None and self.hash_cache is not None:
+                if state.hash_cache_snapshot is not None and self.hash_cache is not None:
                     self.hash_cache.clear()
-                    self.hash_cache.update(hash_cache_snapshot)
+                    self.hash_cache.update(state.hash_cache_snapshot)
                 if rollback_errors:
                     message = f"{exc}; rollback also failed: {'; '.join(rollback_errors)}"
-                    write_manifest(
-                        self.plan,
+                    self._write_phase_manifest(
+                        state,
                         "recovery-required",
                         error=message,
-                        owned_staging_files=owned_staging_files,
                         rollback_status=rollback_status,
                     )
                     raise InstallError(message) from exc
-            write_manifest(
-                self.plan,
+            self._write_phase_manifest(
+                state,
                 "recovery-required" if isinstance(exc, _RestoreFailure) else "failed",
                 error=str(exc),
-                owned_staging_files=owned_staging_files,
                 rollback_status=rollback_status,
             )
             self._emit("failed", redact_sensitive(exc), cancellable=False)
             raise
+
+    def _write_phase_manifest(
+        self,
+        state: _ExecutionState,
+        phase: str,
+        *,
+        error: str | None = None,
+        rollback_status: Iterable[dict[str, Any]] = (),
+        retained_backups: Iterable[Path] = (),
+        keep_backups: bool = False,
+    ) -> None:
+        """Record the phase before mutating files so recovery sees the operation."""
+        write_manifest(
+            self.plan,
+            phase,
+            error=error,
+            owned_staging_files=state.owned_staging_files,
+            rollback_status=rollback_status,
+            retained_backups=retained_backups,
+            keep_backups=keep_backups,
+        )
+
+    def _stage_artifacts(self, state: _ExecutionState) -> None:
+        xet_checked = False
+        for artifact in self.plan.artifacts:
+            self.cancellation.raise_if_cancelled()
+            download_root = artifact.download_dir.resolve(strict=False)
+            state.owned_staging_files.update(
+                path for path in _files_under(artifact.download_dir)
+                if path.is_relative_to(download_root)
+            )
+            self._write_phase_manifest(state, "downloading")
+            if not artifact.staged_path.is_file() or artifact.staged_path.stat().st_size != artifact.expected_size:
+                if not xet_checked:
+                    available, reason = check_xet_acceleration(
+                        artifact.download_dir / ".hf-xet"
+                    )
+                    xet_checked = True
+                    if not available:
+                        self._emit(
+                            "downloading",
+                            f"Xet acceleration unavailable ({reason}); transfers will use the slower HTTP path.",
+                        )
+                self._emit("downloading", f"Downloading {artifact.label}", artifact=artifact)
+                try:
+                    self.downloader.download(
+                        artifact,
+                        cancellation=self.cancellation,
+                        progress=lambda done, total, current=artifact: self._emit(
+                            "downloading",
+                            f"Downloading {current.label}",
+                            artifact=current,
+                            completed=done,
+                            total=total,
+                        ),
+                    )
+                finally:
+                    state.owned_staging_files.update(
+                        path for path in _files_under(artifact.download_dir)
+                        if path.is_relative_to(download_root)
+                    )
+                    self._write_phase_manifest(state, "downloading")
+            self._emit("verifying", f"Verifying {artifact.label}", artifact=artifact)
+            verify_staged_artifact(
+                artifact,
+                cancellation=self.cancellation,
+                progress=lambda done, total, current=artifact: self._emit(
+                    "verifying",
+                    f"Verifying {current.label}",
+                    artifact=current,
+                    completed=done,
+                    total=total,
+                ),
+            )
+            marker = _verification_marker_path(artifact.staged_path)
+            if marker.is_file():
+                state.owned_staging_files.add(marker)
+                self._write_phase_manifest(state, "downloading")
+
+    def _install_artifacts(self, state: _ExecutionState) -> None:
+        self._emit(
+            "installing",
+            "Installing verified artifacts",
+            total=len(self.plan.artifacts),
+            cancellable=False,
+        )
+        # Publish the non-cancellable boundary synchronously before the
+        # final cancellation check. A cancellation that already won still
+        # aborts here; otherwise observers know shutdown must defer before
+        # any manifest/install filesystem mutation begins.
+        self.cancellation.raise_if_cancelled()
+        self._write_phase_manifest(state, "installing")
+        for index, artifact in enumerate(self.plan.artifacts, start=1):
+            artifact.destination.parent.mkdir(parents=True, exist_ok=True)
+            if artifact.backup_path.exists():
+                raise InstallError(
+                    f"Rollback path already exists; recovery is required: {artifact.backup_path}"
+                )
+            had_original = artifact.destination.exists()
+            state.pending_install = (artifact, had_original)
+            try:
+                if had_original:
+                    self._replace_file(artifact.destination, artifact.backup_path)
+                self._replace_file(artifact.staged_path, artifact.destination)
+            except OSError as exc:
+                if had_original and artifact.backup_path.exists() and not artifact.destination.exists():
+                    try:
+                        self._replace_file(artifact.backup_path, artifact.destination)
+                    except OSError as restore_exc:
+                        raise _RestoreFailure(
+                            f"Could not restore {artifact.destination} from "
+                            f"{artifact.backup_path} after install failed: {exc}; "
+                            f"restore failed: {restore_exc}"
+                        ) from restore_exc
+                    state.pending_install = None
+                if isinstance(exc, PermissionError):
+                    raise InstallError(
+                        f"Model file is in use: {artifact.destination}. "
+                        "Unload the model in LM Studio and retry."
+                    ) from exc
+                raise InstallError(f"Could not install {artifact.destination}: {exc}") from exc
+            state.installed.append((artifact, had_original))
+            state.pending_install = None
+            self._emit(
+                "installing",
+                f"Installed {artifact.label}",
+                artifact=artifact,
+                completed=index,
+                total=len(self.plan.artifacts),
+                cancellable=False,
+            )
+
+    def _validate_artifacts(
+        self,
+        state: _ExecutionState,
+        post_install_validator: Callable[[UpdatePlan], None],
+    ) -> None:
+        self._write_phase_manifest(state, "validating")
+        self._emit("validating", "Running post-install model check", cancellable=False)
+        if self.hash_cache is not None:
+            state.hash_cache_snapshot = {
+                key: dict(value) if isinstance(value, dict) else value
+                for key, value in self.hash_cache.items()
+            }
+            for artifact in self.plan.artifacts:
+                cache_verified_oid(
+                    artifact.destination,
+                    artifact.expected_sha256,
+                    self.hash_cache,
+                    models_root=self.plan.models_root,
+                )
+        post_install_validator(self.plan)
+
+    def _finalize_artifacts(self, state: _ExecutionState) -> UpdateResult:
+        retained = [
+            artifact.backup_path
+            for artifact, had_original in state.installed
+            if had_original and artifact.backup_path.is_file()
+        ]
+        backups = [str(path) for path in retained] if self.keep_backups else []
+        cleanup_warnings: list[str] = []
+        completion_phase = (
+            "completed-backups-kept" if self.keep_backups and retained
+            else "completed-cleanup-pending" if retained
+            else "completed"
+        )
+
+        try:
+            self._write_phase_manifest(
+                state,
+                completion_phase,
+                retained_backups=retained,
+                keep_backups=self.keep_backups,
+            )
+            cleanup_warnings.extend(
+                self._cleanup_staging(
+                    state.owned_staging_files,
+                    remove_manifest=not retained,
+                )
+            )
+            if cleanup_warnings:
+                self._write_phase_manifest(
+                    state,
+                    completion_phase if retained else "completed-cleanup-pending",
+                    error="; ".join(cleanup_warnings),
+                    retained_backups=retained,
+                    keep_backups=self.keep_backups,
+                )
+        except OSError as exc:
+            cleanup_warnings.append(f"Could not fully clean staging data: {exc}")
+            try:
+                self._write_phase_manifest(
+                    state,
+                    completion_phase if retained else "completed-cleanup-pending",
+                    error="; ".join(cleanup_warnings),
+                    retained_backups=retained,
+                    keep_backups=self.keep_backups,
+                )
+            except OSError:
+                pass
+        self._emit("completed", "Update completed", cancellable=False)
+        message = "All selected artifacts were updated and verified."
+        if cleanup_warnings:
+            message += " Cleanup remains: " + "; ".join(cleanup_warnings)
+        return UpdateResult(
+            job_id=self.plan.job_id,
+            success=True,
+            updated_paths=tuple(str(a.destination) for a in self.plan.artifacts),
+            backup_paths=tuple(backups),
+            completed_at_utc=format_utc(datetime.now(timezone.utc)),
+            message=message,
+        )
 
     def _rollback(
         self, installed: list[tuple[UpdateArtifact, bool]]

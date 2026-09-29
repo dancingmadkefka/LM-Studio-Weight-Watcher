@@ -20,7 +20,6 @@ from typing import Any, Callable, Iterable, Protocol, Sequence
 
 from lmstudio_alert_state import apply_results, default_state_path, load_state, save_state
 from lmstudio_weight_checker import (
-    ArtifactResult,
     CheckerError,
     CheckResult,
     cache_verified_oid,

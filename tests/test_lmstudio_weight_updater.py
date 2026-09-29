@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import builtins
 import contextlib
 import hashlib
@@ -32,6 +33,7 @@ from lmstudio_weight_updater import (
     main,
     parse_args,
     recover_interrupted_jobs,
+    run_update_plan,
     verify_staged_artifact,
     summarize_recovery_actions,
     write_manifest,
@@ -387,6 +389,132 @@ class ExecutionTests(unittest.TestCase):
             )],
         )
         return build_update_plan([result], models_root=root, safety_reserve_bytes=0)
+
+    def test_shared_run_returns_result_and_fresh_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            fresh = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(
+                    destination=plan.artifacts[0].destination,
+                    remote_file="model.gguf", content=b"new",
+                )],
+            )
+            fresh.status = "up-to-date"
+            with (patch("lmstudio_weight_updater.collect_check_results", return_value=[fresh]),
+                  patch("lmstudio_weight_updater.save_hash_cache")):
+                result, results = run_update_plan(
+                    plan, timeout_seconds=5, hash_cache={},
+                    hash_cache_path=root / "hash-cache.json",
+                    downloader=FakeDownloader(contents),
+                )
+            self.assertTrue(result.success)
+            self.assertEqual(result.job_id, plan.job_id)
+            self.assertEqual(results, [fresh])
+
+    def test_shared_run_validator_rejects_non_up_to_date_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            stale = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(
+                    destination=plan.artifacts[0].destination,
+                    remote_file="model.gguf", content=b"new",
+                )],
+            )
+            with (patch("lmstudio_weight_updater.collect_check_results", return_value=[stale]),
+                  patch("lmstudio_weight_updater.save_hash_cache")):
+                with self.assertRaisesRegex(
+                    InstallError, "Post-install checker did not confirm success: model: update-available"
+                ):
+                    run_update_plan(
+                        plan, timeout_seconds=5, hash_cache={},
+                        hash_cache_path=root / "hash-cache.json",
+                        downloader=FakeDownloader(contents),
+                    )
+
+    def test_shared_run_saves_hash_cache_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            fresh = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(
+                    destination=plan.artifacts[0].destination,
+                    remote_file="model.gguf", content=b"new",
+                )],
+            )
+            fresh.status = "up-to-date"
+            cache = {}
+            with (patch("lmstudio_weight_updater.collect_check_results", return_value=[fresh]),
+                  patch("lmstudio_weight_updater.save_hash_cache") as save):
+                run_update_plan(
+                    plan, timeout_seconds=5, hash_cache=cache,
+                    hash_cache_path=root / "hash-cache.json",
+                    downloader=FakeDownloader(contents),
+                )
+            save.assert_called_once_with(root / "hash-cache.json", cache)
+
+    def test_shared_run_saves_hash_cache_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, _contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            cache = {}
+            with (patch("lmstudio_weight_updater.UpdateExecutor.execute",
+                        side_effect=InstallError("install failed")),
+                  patch("lmstudio_weight_updater.save_hash_cache") as save):
+                with self.assertRaisesRegex(InstallError, "install failed"):
+                    run_update_plan(
+                        plan, timeout_seconds=5, hash_cache=cache,
+                        hash_cache_path=root / "hash-cache.json",
+                    )
+            save.assert_called_once_with(root / "hash-cache.json", cache)
+
+    def test_shared_run_saves_failure_refresh_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, _contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            cache = {}
+            failure_results = []
+            saved_snapshots = []
+            stale = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(
+                    destination=plan.artifacts[0].destination,
+                    remote_file="model.gguf", content=b"new",
+                )],
+            )
+
+            def refresh(**_kwargs):
+                cache["refreshed"] = {"sha256": "abc"}
+                return [stale]
+
+            with (patch("lmstudio_weight_updater.UpdateExecutor.execute",
+                        side_effect=InstallError("install failed")),
+                  patch("lmstudio_weight_updater.collect_check_results", side_effect=refresh),
+                  patch("lmstudio_weight_updater.save_hash_cache",
+                        side_effect=lambda _path, data: saved_snapshots.append(dict(data))) as save):
+                with self.assertRaisesRegex(InstallError, "install failed"):
+                    run_update_plan(
+                        plan, timeout_seconds=5, hash_cache=cache,
+                        hash_cache_path=root / "hash-cache.json",
+                        failure_results_out=failure_results,
+                    )
+            self.assertEqual(failure_results, [stale])
+            save.assert_called_once_with(root / "hash-cache.json", cache)
+            self.assertIn("refreshed", saved_snapshots[0])
+
+    def test_cli_and_tray_share_the_run_function(self) -> None:
+        import lmstudio_weight_updater as updater
+        import lmstudio_weight_watcher as watcher
+
+        self.assertIs(updater.run_update_plan, watcher.run_update_plan)
+        tree = ast.parse(Path(watcher.__file__).read_text(encoding="utf-8"))
+        for function in (node for node in ast.walk(tree)
+                         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            self.assertFalse(any(
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "Post-install checker did not confirm success" in node.value
+                for node in ast.walk(function)
+            ), function.name)
 
     def test_missing_xet_emits_one_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

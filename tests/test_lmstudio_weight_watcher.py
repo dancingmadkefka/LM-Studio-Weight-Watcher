@@ -31,7 +31,7 @@ from lmstudio_weight_watcher import (
     remote_file_basename,
     split_remote_repo,
 )
-from lmstudio_weight_updater import CancellationToken, ProgressEvent, RecoveryAction, UpdatePlan
+from lmstudio_weight_updater import CancellationToken, InstallError, ProgressEvent, RecoveryAction, UpdatePlan
 
 
 class HfUrlTests(unittest.TestCase):
@@ -525,6 +525,33 @@ class WatcherLifecycleTests(unittest.TestCase):
         self.assertTrue(app.state["last_update"]["success"])
         app.refresh_ui.assert_called()
         app.schedule_next_check.assert_called_once()
+
+    def test_finish_update_applies_returned_results(self) -> None:
+        app = self.make_app()
+        app.state["alerts"] = {"model": {"status": "pending"}}
+        fresh = Mock(model_key="model", status="up-to-date")
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.finish_update(UpdateWorkerOutcome(True, False, "Done", [fresh]))
+        self.assertEqual(app.state["alerts"], {})
+        self.assertEqual(app.state["last_summary"]["checked"], 1)
+        self.assertEqual(app.state["last_summary"]["up_to_date"], 1)
+
+    def test_update_worker_keeps_failure_refresh_results(self) -> None:
+        app = self.make_app()
+        fresh = Mock(model_key="model", status="up-to-date")
+
+        def failed_run(_plan, *, failure_results_out, **_kwargs):
+            failure_results_out.append(fresh)
+            raise InstallError("install failed")
+
+        with (patch("lmstudio_weight_watcher.load_hash_cache", return_value={}),
+              patch("lmstudio_weight_watcher.run_update_plan", side_effect=failed_run),
+              patch("lmstudio_weight_watcher.save_state")):
+            app.update_worker(self.make_plan(), CancellationToken())
+            app.root.after.assert_called_once()
+            app.root.after.call_args.args[1]()
+        self.assertEqual(app.state["last_summary"]["up_to_date"], 1)
+        self.assertFalse(app.state["last_update"]["success"])
 
     def test_locked_update_failure_shows_unload_guidance(self) -> None:
         app = self.make_app()

@@ -44,16 +44,14 @@ from lmstudio_weight_checker import (
 )  
 from lmstudio_weight_updater import (
     CancellationToken,
-    InstallError,
     ProgressEvent,
     UpdateCancelled,
-    UpdateExecutor,
     UpdatePlan,
     build_update_plan,
-    collect_check_results,
     format_bytes,
     recover_interrupted_jobs,
     redact_sensitive,
+    run_update_plan,
 )
   
 DEFAULT_CHECK_INTERVAL_HOURS = 6  
@@ -764,47 +762,21 @@ class WatcherApp:
     def update_worker(self, plan: UpdatePlan, cancellation: CancellationToken) -> None:
         hash_cache = load_hash_cache(self.hash_cache_path)
         latest_results: list = []
-
-        def validate(completed_plan: UpdatePlan) -> None:
-            nonlocal latest_results
-            latest_results = collect_check_results(
-                models_root=completed_plan.models_root,
-                timeout_seconds=self.timeout_seconds,
-                hash_cache=hash_cache,
-            )
-            by_key = {result.model_key: result for result in latest_results}
-            failures = [
-                f"{key}: {by_key.get(key).status if by_key.get(key) else 'missing'}"
-                for key in completed_plan.selected_model_keys
-                if key not in by_key or by_key[key].status != "up-to-date"
-            ]
-            if failures:
-                raise InstallError(
-                    "Post-install checker did not confirm success: " + ", ".join(failures)
-                )
-
         try:
-            result = UpdateExecutor(
+            result, latest_results = run_update_plan(
                 plan,
                 cancellation=cancellation,
                 progress=self.post_update_progress,
+                timeout_seconds=self.timeout_seconds,
                 hash_cache=hash_cache,
-            ).execute(post_install_validator=validate)
+                hash_cache_path=self.hash_cache_path,
+                failure_results_out=latest_results,
+            )
             outcome = UpdateWorkerOutcome(True, False, result.message, latest_results)
         except UpdateCancelled as exc:
             outcome = UpdateWorkerOutcome(False, True, redact_sensitive(exc), [])
         except Exception as exc:
-            try:
-                latest_results = collect_check_results(
-                    models_root=plan.models_root,
-                    timeout_seconds=self.timeout_seconds,
-                    hash_cache=hash_cache,
-                )
-            except Exception:
-                latest_results = []
             outcome = UpdateWorkerOutcome(False, False, redact_sensitive(exc), latest_results)
-        finally:
-            save_hash_cache(self.hash_cache_path, hash_cache)
 
         if self.shutting_down:
             return

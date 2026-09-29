@@ -1506,6 +1506,62 @@ def collect_check_results(
     )
 
 
+def run_update_plan(
+    plan: UpdatePlan,
+    *,
+    cancellation: CancellationToken | None = None,
+    progress: ProgressCallback | None = None,
+    timeout_seconds: int,
+    hash_cache: dict[str, dict[str, Any]],
+    hash_cache_path: Path,
+    keep_backups: bool = False,
+    downloader: ArtifactDownloader | None = None,
+    failure_results_out: list[CheckResult] | None = None,
+) -> tuple[UpdateResult, list[CheckResult]]:
+    """Execute and validate one update, then persist its hash cache once."""
+    latest_results: list[CheckResult] = []
+
+    def validate(completed_plan: UpdatePlan) -> None:
+        nonlocal latest_results
+        latest_results = collect_check_results(
+            models_root=completed_plan.models_root,
+            timeout_seconds=timeout_seconds,
+            hash_cache=hash_cache,
+        )
+        by_key = {result.model_key: result for result in latest_results}
+        failures = [
+            f"{key}: {by_key.get(key).status if by_key.get(key) else 'missing'}"
+            for key in completed_plan.selected_model_keys
+            if key not in by_key or by_key[key].status != "up-to-date"
+        ]
+        if failures:
+            raise InstallError("Post-install checker did not confirm success: " + ", ".join(failures))
+
+    try:
+        result = UpdateExecutor(
+            plan,
+            downloader=downloader,
+            cancellation=cancellation,
+            progress=progress,
+            keep_backups=keep_backups,
+            hash_cache=hash_cache,
+        ).execute(post_install_validator=validate)
+        return result, latest_results
+    except Exception as exc:
+        if failure_results_out is not None and not isinstance(exc, UpdateCancelled):
+            try:
+                failure_results_out.extend(collect_check_results(
+                    models_root=plan.models_root,
+                    timeout_seconds=timeout_seconds,
+                    hash_cache=hash_cache,
+                ))
+            except Exception:
+                pass
+        raise
+    finally:
+        save_hash_cache(hash_cache_path, hash_cache)
+
+
 def _select_results(results: Sequence[CheckResult], args: argparse.Namespace) -> list[CheckResult]:
     if args.all:
         selected = [
@@ -1533,6 +1589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     state_path = (args.state_file or default_state_path()).expanduser()
     hash_cache_path = state_path.parent / "local_hash_cache.json"
     hash_cache = load_hash_cache(hash_cache_path)
+    update_run_started = False
     try:
         models_root = discover_models_root(args.models_root)
         recovery = recover_interrupted_jobs(models_root)
@@ -1591,37 +1648,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("Cancelled.")
                 return 2
 
-        latest_results: list[CheckResult] = []
-
-        def validate(completed_plan: UpdatePlan) -> None:
-            nonlocal latest_results
-            latest_results = collect_check_results(
-                models_root=models_root,
-                timeout_seconds=args.timeout_seconds,
-                hash_cache=hash_cache,
-            )
-            by_key = {result.model_key: result for result in latest_results}
-            failures = [
-                f"{key}: {by_key.get(key).status if by_key.get(key) else 'missing'}"
-                for key in completed_plan.selected_model_keys
-                if key not in by_key or by_key[key].status != "up-to-date"
-            ]
-            if failures:
-                raise InstallError("Post-install checker did not confirm success: " + ", ".join(failures))
-
         def show_progress(event: ProgressEvent) -> None:
             suffix = ""
             if event.bytes_total:
                 suffix = f" ({format_bytes(event.bytes_completed)} / {format_bytes(event.bytes_total)})"
             print(f"[{event.phase}] {event.message}{suffix}", file=sys.stderr)
 
-        result = UpdateExecutor(
+        update_run_started = True
+        result, latest_results = run_update_plan(
             plan,
             progress=show_progress,
+            timeout_seconds=args.timeout_seconds,
             keep_backups=args.keep_backups,
             hash_cache=hash_cache,
-        ).execute(post_install_validator=validate)
-        save_hash_cache(hash_cache_path, hash_cache)
+            hash_cache_path=hash_cache_path,
+        )
         if latest_results:
             state = apply_results(
                 load_state(state_path),
@@ -1648,7 +1689,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {redact_sensitive(exc)}", file=sys.stderr)
         return 1
     finally:
-        save_hash_cache(hash_cache_path, hash_cache)
+        # Checks before confirmation can populate the cache without starting a
+        # run. The shared runner handles the save once an update begins.
+        if not update_run_started:
+            save_hash_cache(hash_cache_path, hash_cache)
 
 
 if __name__ == "__main__":

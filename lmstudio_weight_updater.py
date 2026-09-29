@@ -978,8 +978,33 @@ class UpdateExecutor:
                     model_keys=artifact.model_keys if artifact else (),
                 )
             )
+        except UpdateCancelled:
+            raise
         except Exception:
             # UI/log observers must never compromise an update transaction.
+            pass
+
+    def _emit_uninterruptible(
+        self,
+        phase: str,
+        message: str,
+        *,
+        artifact: UpdateArtifact | None = None,
+        completed: int = 0,
+        total: int = 0,
+    ) -> None:
+        try:
+            self._emit(
+                phase,
+                message,
+                artifact=artifact,
+                completed=completed,
+                total=total,
+                cancellable=False,
+            )
+        except UpdateCancelled:
+            # An observer cannot turn an installed or terminal job into a
+            # cancelled one after the non-cancellable boundary.
             pass
 
     def execute(self, *, post_install_validator: Callable[[UpdatePlan], None]) -> UpdateResult:
@@ -1016,7 +1041,7 @@ class UpdateExecutor:
                 "cancelled",
                 error=str(exc),
             )
-            self._emit("cancelled", str(exc), cancellable=False)
+            self._emit_uninterruptible("cancelled", str(exc))
             raise
         except Exception as exc:
             rollback_status: list[dict[str, Any]] = []
@@ -1058,7 +1083,7 @@ class UpdateExecutor:
                 error=str(exc),
                 rollback_status=rollback_status,
             )
-            self._emit("failed", redact_sensitive(exc), cancellable=False)
+            self._emit_uninterruptible("failed", redact_sensitive(exc))
             raise
 
     def _write_phase_manifest(
@@ -1183,13 +1208,12 @@ class UpdateExecutor:
                 raise InstallError(f"Could not install {artifact.destination}: {exc}") from exc
             state.installed.append((artifact, had_original))
             state.pending_install = None
-            self._emit(
+            self._emit_uninterruptible(
                 "installing",
                 f"Installed {artifact.label}",
                 artifact=artifact,
                 completed=index,
                 total=len(self.plan.artifacts),
-                cancellable=False,
             )
 
     def _validate_artifacts(
@@ -1198,7 +1222,7 @@ class UpdateExecutor:
         post_install_validator: Callable[[UpdatePlan], None],
     ) -> None:
         self._write_phase_manifest(state, "validating")
-        self._emit("validating", "Running post-install model check", cancellable=False)
+        self._emit_uninterruptible("validating", "Running post-install model check")
         if self.hash_cache is not None:
             state.hash_cache_snapshot = {
                 key: dict(value) if isinstance(value, dict) else value
@@ -1260,7 +1284,7 @@ class UpdateExecutor:
                 )
             except OSError:
                 pass
-        self._emit("completed", "Update completed", cancellable=False)
+        self._emit_uninterruptible("completed", "Update completed")
         message = "All selected artifacts were updated and verified."
         if cleanup_warnings:
             message += " Cleanup remains: " + "; ".join(cleanup_warnings)

@@ -390,6 +390,41 @@ class ExecutionTests(unittest.TestCase):
         )
         return build_update_plan([result], models_root=root, safety_reserve_bytes=0)
 
+    def test_progress_callback_cancellation_stops_before_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            downloader = FakeDownloader(contents)
+
+            def cancel_on_download(event):
+                if event.phase == "downloading":
+                    raise UpdateCancelled("cancelled by observer")
+
+            with (patch("lmstudio_weight_updater.check_xet_acceleration",
+                        return_value=(True, "")),
+                  self.assertRaisesRegex(UpdateCancelled, "cancelled by observer")):
+                UpdateExecutor(
+                    plan, downloader=downloader, progress=cancel_on_download
+                ).execute(post_install_validator=lambda _plan: None)
+            self.assertEqual(downloader.calls, [])
+            self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old")
+            self.assertFalse(plan.artifacts[0].backup_path.exists())
+
+    def test_late_observer_cancellation_cannot_mark_installed_job_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+
+            def cancel_after_install(event):
+                if event.message.startswith("Installed ") or event.phase in {"validating", "completed"}:
+                    raise UpdateCancelled("too late")
+
+            result = UpdateExecutor(
+                plan, downloader=FakeDownloader(contents), progress=cancel_after_install
+            ).execute(post_install_validator=lambda _plan: None)
+            self.assertTrue(result.success)
+            self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"new")
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["phase"], "completed-cleanup-pending")
+
     def test_manifest_records_phase_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])

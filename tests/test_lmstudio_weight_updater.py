@@ -912,6 +912,35 @@ class ExecutionTests(unittest.TestCase):
                         artifact, cancellation=CancellationToken(), progress=lambda _done, _total: None
                     )
 
+    def test_downloader_final_stat_error_names_artifact_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            expected = artifact.staged_path.resolve(strict=False)
+            original_stat = Path.stat
+            progress_calls = []
+
+            def fake_download(**_kwargs):
+                artifact.staged_path.write_bytes(contents[artifact.remote_file])
+                return str(artifact.staged_path)
+
+            def fail_final_stat(path, *args, **kwargs):
+                if path == expected:
+                    raise OSError("file vanished")
+                return original_stat(path, *args, **kwargs)
+
+            with (patch("huggingface_hub.hf_hub_download", side_effect=fake_download),
+                  patch.object(Path, "stat", autospec=True, side_effect=fail_final_stat)):
+                with self.assertRaises(UpdateError) as raised:
+                    HuggingFaceDownloader().download(
+                        artifact, cancellation=CancellationToken(),
+                        progress=lambda done, total: progress_calls.append((done, total)),
+                    )
+            self.assertIn(artifact.label, str(raised.exception))
+            self.assertIn(str(expected), str(raised.exception))
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertEqual(progress_calls, [])
+
     def test_successful_update_reports_no_cleanup_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])

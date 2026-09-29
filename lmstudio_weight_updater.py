@@ -924,7 +924,13 @@ class HuggingFaceDownloader:
             raise UpdateError(
                 f"Hugging Face returned an unexpected staging path: {path} (expected {expected})."
             )
-        progress(path.stat().st_size, artifact.expected_size)
+        try:
+            downloaded_size = path.stat().st_size
+        except OSError as exc:
+            raise UpdateError(
+                f"Could not inspect downloaded artifact {artifact.label} at {path}: {exc}"
+            ) from exc
+        progress(downloaded_size, artifact.expected_size)
         return path
 
 

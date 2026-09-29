@@ -20,6 +20,7 @@ from lmstudio_weight_updater import (
     UpdateExecutor,
     _select_results,
     build_update_plan,
+    cleanup_pending_backups,
     main,
     parse_args,
     recover_interrupted_jobs,
@@ -378,9 +379,101 @@ class ExecutionTests(unittest.TestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"new bytes")
-            self.assertFalse(plan.artifacts[0].backup_path.exists())
-            self.assertFalse(plan.staging_root.exists())
+            self.assertEqual(plan.artifacts[0].backup_path.read_bytes(), b"old")
+            self.assertTrue(plan.manifest_path.exists())
+            self.assertFalse(plan.artifacts[0].staged_path.exists())
             self.assertEqual(cache["org/repo/model.gguf"]["sha256"], digest(b"new bytes"))
+
+    def test_success_retains_backups_until_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            result = UpdateExecutor(plan, downloader=FakeDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result.success)
+            self.assertEqual(result.backup_paths, ())
+            self.assertEqual(result.message, "All selected artifacts were updated and verified.")
+            self.assertEqual(plan.artifacts[0].backup_path.read_bytes(), b"old")
+            self.assertEqual(manifest["phase"], "completed-cleanup-pending")
+            self.assertEqual(manifest["retained_backups"], [str(plan.artifacts[0].backup_path)])
+
+    def test_cleanup_pass_removes_only_manifested_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            UpdateExecutor(plan, downloader=FakeDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            unrelated = plan.artifacts[0].destination.with_name("unrelated.txt")
+            unrelated.write_text("keep", encoding="utf-8")
+            actions = cleanup_pending_backups(root, model_is_current=lambda _keys: True)
+            self.assertTrue(any(action.action == "cleaned" for action in actions))
+            self.assertFalse(plan.artifacts[0].backup_path.exists())
+            self.assertFalse(plan.manifest_path.exists())
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep")
+
+    def test_recovery_restores_missing_destination_from_pending_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            UpdateExecutor(plan, downloader=FakeDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            plan.artifacts[0].destination.unlink()
+            actions = recover_interrupted_jobs(root)
+            self.assertTrue(any(action.action == "restored" for action in actions))
+            self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old")
+            self.assertEqual(plan.artifacts[0].backup_path.read_bytes(), b"old")
+
+    def test_cleanup_pass_keeps_backups_when_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            UpdateExecutor(plan, downloader=FakeDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            first = cleanup_pending_backups(root, model_is_current=lambda _keys: False)
+            second = cleanup_pending_backups(root, model_is_current=lambda _keys: False)
+            self.assertEqual([action.action for action in first], ["reported"])
+            self.assertEqual(second, [])
+            self.assertEqual(plan.artifacts[0].backup_path.read_bytes(), b"old")
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(manifest["cleanup_reported"])
+
+    def test_keep_backups_survives_cleanup_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            result = UpdateExecutor(
+                plan, downloader=FakeDownloader(contents), keep_backups=True
+            ).execute(post_install_validator=lambda _plan: None)
+            actions = cleanup_pending_backups(root, model_is_current=lambda _keys: True)
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(actions, [])
+            self.assertEqual(result.backup_paths, (str(plan.artifacts[0].backup_path),))
+            self.assertEqual(plan.artifacts[0].backup_path.read_bytes(), b"old")
+            self.assertEqual(manifest["phase"], "completed-backups-kept")
+            self.assertTrue(manifest["keep_backups"])
+
+    def test_cleanup_ignores_unmanifested_backup_looking_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, _contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            lookalike = plan.artifacts[0].backup_path
+            lookalike.write_bytes(b"user data")
+            actions = cleanup_pending_backups(root, model_is_current=lambda _keys: True)
+            self.assertEqual(actions, [])
+            self.assertEqual(lookalike.read_bytes(), b"user data")
+
+    def test_next_execute_cleans_previous_validated_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            _root, first, contents = self.make_plan(base, [("one.gguf", b"old", b"new")])
+            UpdateExecutor(first, downloader=FakeDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            _root, second, contents = self.make_plan(base, [("two.gguf", b"old2", b"new2")])
+            UpdateExecutor(second, downloader=FakeDownloader(contents)).execute(
+                post_install_validator=lambda _plan: None
+            )
+            self.assertFalse(first.artifacts[0].backup_path.exists())
+            self.assertTrue(second.artifacts[0].backup_path.exists())
 
     def test_hash_mismatch_leaves_installed_file_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -808,6 +901,37 @@ class RecoveryTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_second_cli_run_cleans_backup_in_scratch_models_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "models"
+            target = root / "org" / "repo" / "model.gguf"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"old")
+            result = check_result(
+                key="model", name="Model", repo="org/repo",
+                artifacts=[artifact_result(destination=target, remote_file="model.gguf", content=b"new")],
+            )
+            plan = build_update_plan([result], models_root=root, safety_reserve_bytes=0)
+            UpdateExecutor(plan, downloader=FakeDownloader({"model.gguf": b"new"})).execute(
+                post_install_validator=lambda _plan: None
+            )
+            self.assertEqual(plan.artifacts[0].backup_path.read_bytes(), b"old")
+            result.status = "up-to-date"
+            result.artifacts[0].status = "up-to-date"
+            with (
+                patch("lmstudio_weight_updater.discover_models_root", return_value=root),
+                patch("lmstudio_weight_updater.collect_check_results", return_value=[result]),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = main([
+                    "--all", "--yes", "--models-root", str(root),
+                    "--state-file", str(base / "state.json"),
+                ])
+            self.assertEqual(code, 0)
+            self.assertEqual(target.read_bytes(), b"new")
+            self.assertFalse(plan.artifacts[0].backup_path.exists())
+
     def test_parser_exposes_required_cli_options(self) -> None:
         args = parse_args(
             [

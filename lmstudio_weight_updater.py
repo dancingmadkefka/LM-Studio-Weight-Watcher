@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -532,6 +533,8 @@ def write_manifest(
     error: str | None = None,
     owned_staging_files: Iterable[Path] = (),
     rollback_status: Iterable[dict[str, Any]] = (),
+    retained_backups: Iterable[Path] = (),
+    keep_backups: bool = False,
 ) -> None:
     payload = {
         "version": MANIFEST_VERSION,
@@ -543,8 +546,112 @@ def write_manifest(
         "owned_staging_files": sorted(str(Path(path).resolve()) for path in owned_staging_files),
         "artifacts": [artifact.manifest_dict() for artifact in plan.artifacts],
         "rollback_status": list(rollback_status),
+        "selected_model_keys": list(plan.selected_model_keys),
+        "retained_backups": sorted(str(path) for path in retained_backups),
+        "keep_backups": keep_backups,
+        "cleanup_reported": False,
     }
     _write_json_atomic(plan.manifest_path, payload)
+
+
+def _flush_parent_directory(path: Path) -> None:
+    if os.name == "nt":
+        # NTFS orders metadata updates; Windows does not expose directory fsync.
+        return
+    try:
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EBADF}:
+            raise
+
+
+def cleanup_pending_backups(
+    models_root: Path,
+    *,
+    model_is_current: Callable[[tuple[str, ...]], bool],
+) -> list[RecoveryAction]:
+    """Remove only recorded backups after a fresh clean model check."""
+    root = _safe_resolve(models_root)
+    staging_root = staging_root_for(root)
+    jobs_dir = staging_root / "jobs"
+    if not jobs_dir.is_dir():
+        return []
+    actions: list[RecoveryAction] = []
+    for manifest_path in sorted(jobs_dir.glob("job-*.json")):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("phase") != "completed-cleanup-pending" or payload.get("keep_backups"):
+            continue
+        job_id = str(payload.get("job_id", ""))
+        try:
+            if payload.get("version") != MANIFEST_VERSION or manifest_path.stem != job_id:
+                raise PlanError("Manifest identity does not match its filename.")
+            if _safe_resolve(Path(payload["models_root"])) != root:
+                raise PlanError("Manifest models root does not match the current root.")
+            allowed: set[Path] = set()
+            for item in payload["artifacts"]:
+                destination = _ensure_under(Path(item["destination"]), root, label="Cleanup destination")
+                backup = Path(item["backup_path"]).resolve(strict=False)
+                if backup != destination.with_name(destination.name + f".lmww-backup-{job_id}"):
+                    raise PlanError(f"Unexpected rollback path: {backup}")
+                allowed.add(backup)
+            retained = [Path(value).resolve(strict=False) for value in payload["retained_backups"]]
+            if not retained or len(set(retained)) != len(retained) or any(path not in allowed for path in retained):
+                raise PlanError("Retained backup list does not match the manifest artifacts.")
+            model_keys = tuple(str(key) for key in payload["selected_model_keys"])
+            if not model_keys:
+                raise PlanError("Manifest has no model keys for cleanup validation.")
+        except (KeyError, TypeError, ValueError, PlanError) as exc:
+            actions.append(RecoveryAction(job_id, "reported", str(manifest_path), redact_sensitive(exc)))
+            continue
+
+        try:
+            clean = model_is_current(model_keys)
+        except Exception as exc:
+            clean = False
+            check_error = redact_sensitive(exc)
+        else:
+            check_error = "Model check did not confirm an up-to-date model."
+        if not clean:
+            if not payload.get("cleanup_reported"):
+                payload["cleanup_reported"] = True
+                payload["updated_at_utc"] = format_utc(datetime.now(timezone.utc))
+                _write_json_atomic(manifest_path, payload)
+                actions.append(RecoveryAction(job_id, "reported", str(manifest_path), f"Backup cleanup deferred: {check_error}"))
+            continue
+
+        remaining = list(retained)
+        for backup in retained:
+            try:
+                if backup.exists():
+                    if not backup.is_file():
+                        raise OSError(f"Recorded backup is not a file: {backup}")
+                    _flush_parent_directory(backup)
+                    backup.unlink()
+                remaining.remove(backup)
+                payload["retained_backups"] = [str(path) for path in remaining]
+                _write_json_atomic(manifest_path, payload)
+                actions.append(RecoveryAction(job_id, "cleaned", str(backup), "Removed validated rollback file."))
+            except OSError as exc:
+                if not payload.get("cleanup_reported"):
+                    payload["cleanup_reported"] = True
+                    payload["error"] = redact_sensitive(exc)
+                    _write_json_atomic(manifest_path, payload)
+                    actions.append(RecoveryAction(job_id, "reported", str(backup), f"Backup cleanup deferred: {redact_sensitive(exc)}"))
+        if not remaining and not _files_under(staging_root / "downloads"):
+            manifest_path.unlink()
+            for directory in (jobs_dir, staging_root):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+    return actions
 
 
 def compute_verified_sha256(
@@ -694,6 +801,26 @@ class UpdateExecutor:
             pass
 
     def execute(self, *, post_install_validator: Callable[[UpdatePlan], None]) -> UpdateResult:
+        def validate_pending(model_keys: tuple[str, ...]) -> bool:
+            verdict = post_install_validator(
+                replace(self.plan, selected_model_keys=model_keys)
+            )
+            return verdict is not False
+
+        for action in cleanup_pending_backups(
+            self.plan.models_root, model_is_current=validate_pending
+        ):
+            if action.action == "reported":
+                self._emit("validating", action.message, cancellable=False)
+        if self.plan.manifest_path.is_file():
+            try:
+                existing_manifest = json.loads(self.plan.manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_manifest = {}
+            if existing_manifest.get("phase") == "completed-cleanup-pending":
+                raise InstallError(
+                    f"Previous backup cleanup is still pending: {self.plan.manifest_path}"
+                )
         installed: list[tuple[UpdateArtifact, bool]] = []
         pending_install: tuple[UpdateArtifact, bool] | None = None
         owned_staging_files = self._load_owned_staging_files()
@@ -809,49 +936,52 @@ class UpdateExecutor:
                     )
             post_install_validator(self.plan)
 
-            backups: list[str] = []
+            retained = [
+                artifact.backup_path
+                for artifact, had_original in installed
+                if had_original and artifact.backup_path.is_file()
+            ]
+            backups = [str(path) for path in retained] if self.keep_backups else []
             cleanup_warnings: list[str] = []
-            for artifact, had_original in installed:
-                if had_original and artifact.backup_path.exists():
-                    if self.keep_backups:
-                        backups.append(str(artifact.backup_path))
-                    else:
-                        try:
-                            artifact.backup_path.unlink()
-                        except OSError as exc:
-                            backups.append(str(artifact.backup_path))
-                            cleanup_warnings.append(
-                                f"Could not remove rollback file {artifact.backup_path}: {exc}"
-                            )
+            completion_phase = (
+                "completed-backups-kept" if self.keep_backups and retained
+                else "completed-cleanup-pending" if retained
+                else "completed"
+            )
 
             try:
                 write_manifest(
                     self.plan,
-                    "completed" if not cleanup_warnings else "completed-cleanup-pending",
-                    error="; ".join(cleanup_warnings) or None,
+                    completion_phase,
                     owned_staging_files=owned_staging_files,
+                    retained_backups=retained,
+                    keep_backups=self.keep_backups,
                 )
                 cleanup_warnings.extend(
                     self._cleanup_staging(
                         owned_staging_files,
-                        remove_manifest=not cleanup_warnings,
+                        remove_manifest=not retained,
                     )
                 )
                 if cleanup_warnings:
                     write_manifest(
                         self.plan,
-                        "completed-cleanup-pending",
+                        completion_phase if retained else "completed-cleanup-pending",
                         error="; ".join(cleanup_warnings),
                         owned_staging_files=owned_staging_files,
+                        retained_backups=retained,
+                        keep_backups=self.keep_backups,
                     )
             except OSError as exc:
                 cleanup_warnings.append(f"Could not fully clean staging data: {exc}")
                 try:
                     write_manifest(
                         self.plan,
-                        "completed-cleanup-pending",
+                        completion_phase if retained else "completed-cleanup-pending",
                         error="; ".join(cleanup_warnings),
                         owned_staging_files=owned_staging_files,
+                        retained_backups=retained,
+                        keep_backups=self.keep_backups,
                     )
                 except OSError:
                     pass
@@ -1055,6 +1185,7 @@ def recover_interrupted_jobs(models_root: Path) -> list[RecoveryAction]:
         if payload.get("version") != MANIFEST_VERSION:
             actions.append(RecoveryAction(job_id, "reported", str(manifest_path), "Unsupported manifest version."))
             continue
+        completed = payload.get("phase") in {"completed-cleanup-pending", "completed-backups-kept"}
         for item in payload.get("artifacts", []):
             try:
                 destination = _ensure_under(Path(item["destination"]), root, label="Recovery destination")
@@ -1068,7 +1199,7 @@ def recover_interrupted_jobs(models_root: Path) -> list[RecoveryAction]:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(backup, destination)
                 actions.append(RecoveryAction(job_id, "restored", str(destination), "Restored missing destination from rollback."))
-            elif backup.exists():
+            elif backup.exists() and not completed:
                 actions.append(RecoveryAction(job_id, "reported", str(backup), "Destination and rollback both exist; manual inspection required."))
     return actions
 
@@ -1089,7 +1220,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     selection.add_argument("--model-key", action="append", help="Update one model key; repeat to select multiple models.")
     parser.add_argument("--dry-run", action="store_true", help="Print the validated plan without downloading or changing files.")
     parser.add_argument("--yes", action="store_true", help="Confirm replacement without an interactive prompt.")
-    parser.add_argument("--keep-backups", action="store_true", help="Keep rollback files after successful post-install verification.")
+    parser.add_argument("--keep-backups", action="store_true", help="Keep rollback files indefinitely after a successful update.")
     parser.add_argument("--models-root", type=Path, help="Override the LM Studio models root.")
     parser.add_argument("--state-file", type=Path, help="Override watcher state used for alert refresh and hash cache placement.")
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
@@ -1150,7 +1281,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             hash_cache=hash_cache,
         )
-        selected = _select_results(initial_results, args)
+        cleanup_actions: list[RecoveryAction] = []
+        if not args.dry_run:
+            by_key = {result.model_key: result for result in initial_results}
+            cleanup_actions = cleanup_pending_backups(
+                models_root,
+                model_is_current=lambda keys: all(
+                    key in by_key and by_key[key].status == "up-to-date" for key in keys
+                ),
+            )
+            for action in cleanup_actions:
+                if action.action == "reported":
+                    print(f"cleanup: {action.message} ({action.path})", file=sys.stderr)
+        try:
+            selected = _select_results(initial_results, args)
+        except PlanError as exc:
+            if cleanup_actions and str(exc) == "No models with downloadable updates were selected.":
+                print("Pending backup cleanup checked.")
+                return 0
+            raise
         plan = build_update_plan(selected, models_root=models_root)
         if args.dry_run:
             print(json.dumps(plan.summary_dict(), indent=2))

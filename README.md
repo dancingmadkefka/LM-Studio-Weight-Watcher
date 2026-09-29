@@ -63,10 +63,16 @@ All three accept `--models-root`, `--state-file`, and `--timeout-seconds`.
    anything is replaced.
 3. Existing files are renamed to `.lmww-backup-<job>`, the staged files move
    into place, and the checker confirms the models are up to date.
-4. On failure the originals are restored. An install interrupted by a crash is
+4. Rollback copies remain until a later clean check. `--keep-backups` retains
+   them indefinitely.
+5. On failure the originals are restored. An install interrupted by a crash is
    detected on the next start and rolled back; if the state is ambiguous, both
    files are left in place and reported.
-5. Cleanup only deletes files the updater created.
+6. Cleanup only deletes files recorded as updater backups or staging files.
+
+Before deleting a backup, cleanup flushes its directory on systems that allow
+it. Windows has no directory fsync; on NTFS, cleanup relies on metadata
+ordering.
 
 Before downloading, the updater checks free space on the models volume. The
 estimate includes remaining downloads, space for backups, and a reserve at

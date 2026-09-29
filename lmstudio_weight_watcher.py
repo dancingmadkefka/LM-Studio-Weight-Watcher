@@ -551,12 +551,16 @@ class WatcherApp:
         restored = sum(action.action == "restored" for action in outcome.actions)
         cleanup_pending = sum(action.action == "cleanup-pending" for action in outcome.actions)
         attention = sum(action.action == "reported" for action in outcome.actions)
+        cleaned = sum(action.action == "temp-cleaned" for action in outcome.actions)
         error = redact_sensitive(outcome.error) if outcome.error else None
         if error or outcome.actions:
             message = (
                 f"Recovery check failed: {error}" if error else
                 f"Recovery: {restored} restored, {cleanup_pending} cleanup pending, "
-                f"{attention} need attention."
+                f"{attention} need attention"
+                + (f", {cleaned} stale manifest temp {'file' if cleaned == 1 else 'files'} removed"
+                   if cleaned else "")
+                + "."
             )
             self.state["recovery_notice"] = {
                 "message": message,

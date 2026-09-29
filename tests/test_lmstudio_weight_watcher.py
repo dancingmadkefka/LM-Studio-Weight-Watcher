@@ -330,6 +330,24 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.refresh_tray_icon()
         self.assertEqual(app.make_icon_image.call_args.args[0], 0)
 
+    def test_stale_manifest_temp_cleanup_is_reported(self) -> None:
+        app = self.make_app()
+        app.run_check_async = Mock()
+        action = RecoveryAction("unknown", "temp-cleaned", "temp-path", "Removed stale manifest temp file.")
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
+        notice = app.state["recovery_notice"]
+        self.assertIn("1 stale manifest temp file removed", notice["message"])
+        self.assertFalse(notice["attention"])
+
+    def test_backup_cleanup_is_not_reported_as_temp_cleanup(self) -> None:
+        app = self.make_app()
+        app.run_check_async = Mock()
+        action = RecoveryAction("job", "cleaned", "backup-path", "Removed validated rollback file.")
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
+        self.assertNotIn("temp file", app.state["recovery_notice"]["message"])
+
     def test_recovery_quit_after_update_persists_notice(self) -> None:
         app = self.make_app()
         app.quit_after_update = True

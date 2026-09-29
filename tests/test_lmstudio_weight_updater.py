@@ -6,7 +6,9 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +17,7 @@ from lmstudio_weight_updater import (
     CancellationToken,
     InstallError,
     IntegrityError,
+    MANIFEST_TEMP_RE,
     PlanError,
     UpdateCancelled,
     UpdateExecutor,
@@ -891,6 +894,95 @@ class RecoveryTests(unittest.TestCase):
             models_root=root, safety_reserve_bytes=0,
         )
         return root, plan
+
+    def test_write_manifest_leaves_no_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan = self.make_plan(Path(tmp))
+            write_manifest(plan, "downloading")
+            self.assertEqual(list(plan.manifest_path.parent.iterdir()), [plan.manifest_path])
+
+    def test_write_manifest_temp_names_are_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan = self.make_plan(Path(tmp))
+            original = tempfile.NamedTemporaryFile
+            names = []
+            def capture(*args, **kwargs):
+                handle = original(*args, **kwargs)
+                names.append(handle.name)
+                return handle
+            with patch("lmstudio_weight_updater.tempfile.NamedTemporaryFile", side_effect=capture):
+                write_manifest(plan, "downloading")
+                write_manifest(plan, "installing")
+            self.assertEqual(len(set(names)), 2)
+            self.assertTrue(all(Path(name).parent == plan.manifest_path.parent for name in names))
+            self.assertTrue(all(MANIFEST_TEMP_RE.fullmatch(Path(name).name) for name in names))
+
+    def test_write_manifest_cleans_up_after_replace_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan = self.make_plan(Path(tmp))
+            write_manifest(plan, "downloading")
+            before = plan.manifest_path.read_bytes()
+            with patch("lmstudio_weight_updater.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    write_manifest(plan, "installing")
+            self.assertEqual(plan.manifest_path.read_bytes(), before)
+            self.assertEqual(list(plan.manifest_path.parent.iterdir()), [plan.manifest_path])
+
+    def test_write_manifest_cleans_up_after_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan = self.make_plan(Path(tmp))
+            with patch("lmstudio_weight_updater.json.dump", side_effect=OSError("write failed")):
+                with self.assertRaisesRegex(OSError, "write failed"):
+                    write_manifest(plan, "downloading")
+            self.assertEqual(list(plan.manifest_path.parent.iterdir()), [])
+
+    def test_write_manifest_survives_concurrent_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan = self.make_plan(Path(tmp))
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(write_manifest, plan, phase)
+                           for phase in ("installing", "validating")]
+                for future in futures:
+                    future.result()
+            payload = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertIn(payload["phase"], {"installing", "validating"})
+            self.assertEqual(list(plan.manifest_path.parent.iterdir()), [plan.manifest_path])
+
+    def test_recovery_prunes_stale_temp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp))
+            jobs = plan.manifest_path.parent
+            jobs.mkdir(parents=True)
+            old = jobs / f".{plan.manifest_path.name}.abcdef12.tmp"
+            old.write_text("partial", encoding="utf-8")
+            stale_time = time.time() - 7200
+            os.utime(old, (stale_time, stale_time))
+            unrelated = jobs / f".{plan.manifest_path.name}.abcdef12.tmp.keep"
+            unrelated.write_text("keep", encoding="utf-8")
+            actions = recover_interrupted_jobs(root)
+            self.assertFalse(old.exists())
+            self.assertTrue(unrelated.exists())
+            self.assertTrue(any(action.action == "temp-cleaned" and action.path == str(old)
+                                for action in actions))
+
+    def test_recovery_keeps_recent_temp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp))
+            jobs = plan.manifest_path.parent
+            jobs.mkdir(parents=True)
+            recent = jobs / f".{plan.manifest_path.name}.abcdef12.tmp"
+            recent.write_text("in progress", encoding="utf-8")
+            self.assertEqual(recover_interrupted_jobs(root), [])
+            self.assertTrue(recent.exists())
+
+    def test_recovery_reports_invalid_manifest_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan = self.make_plan(Path(tmp))
+            plan.manifest_path.parent.mkdir(parents=True)
+            plan.manifest_path.write_text("{broken", encoding="utf-8")
+            actions = recover_interrupted_jobs(root)
+            self.assertEqual([action.action for action in actions], ["reported"])
+            self.assertTrue(plan.manifest_path.exists())
 
     def test_recovery_finishes_interrupted_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

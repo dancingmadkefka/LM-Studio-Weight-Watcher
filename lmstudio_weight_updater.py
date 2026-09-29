@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -37,6 +38,8 @@ DEFAULT_SAFETY_RESERVE_BYTES = 1024 * 1024 * 1024
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
 OID_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 MANIFEST_VERSION = 1
+MANIFEST_TEMP_MAX_AGE_SECONDS = 3600
+MANIFEST_TEMP_RE = re.compile(r"^\.job-[0-9a-f]{20}\.json\.[a-z0-9_]{8}\.tmp$")
 STAGING_DIRECTORY_NAME = ".weight-watcher-staging"
 SENSITIVE_QUERY_RE = re.compile(
     r"(?i)([?&](?:x-amz-(?:signature|credential|security-token)|signature|token|access_token|auth)=)[^&\s]+"
@@ -521,9 +524,27 @@ def build_update_plan(
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) != 5 or attempt == 4:
+                    raise
+                time.sleep(0.01)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def write_manifest(
@@ -1296,6 +1317,16 @@ def recover_interrupted_jobs(models_root: Path) -> list[RecoveryAction]:
     if jobs_dir.is_dir():
         for path in sorted(jobs_dir.iterdir()):
             if path.is_file() and path not in manifests:
+                if MANIFEST_TEMP_RE.fullmatch(path.name):
+                    try:
+                        if time.time() - path.stat().st_mtime >= MANIFEST_TEMP_MAX_AGE_SECONDS:
+                            path.unlink()
+                            actions.append(RecoveryAction("unknown", "temp-cleaned", str(path),
+                                                          "Removed stale manifest temp file."))
+                    except OSError as exc:
+                        actions.append(RecoveryAction("unknown", "reported", str(path),
+                                                      f"Could not remove stale manifest temp file: {redact_sensitive(exc)}"))
+                    continue
                 actions.append(RecoveryAction("unknown", "reported", str(path),
                                               "Job file has no identifiable manifest; preserved."))
     return actions
@@ -1381,11 +1412,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         recovery = recover_interrupted_jobs(models_root)
         if recovery:
             counts = summarize_recovery_actions(recovery)
+            stale_temps_removed = sum(action.action == "temp-cleaned" for action in recovery)
             print(
                 "recovery: "
                 f"{counts['restored']} restored, "
                 f"{counts['cleanup_pending']} cleanup pending, "
-                f"{counts['attention']} need attention",
+                f"{counts['attention']} need attention"
+                + (f", {stale_temps_removed} stale manifest temp "
+                   f"{'file' if stale_temps_removed == 1 else 'files'} removed"
+                   if stale_temps_removed else ""),
                 file=sys.stderr,
             )
         initial_results = collect_check_results(

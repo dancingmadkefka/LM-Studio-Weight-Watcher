@@ -424,6 +424,80 @@ class ExecutionTests(unittest.TestCase):
                 ).execute(post_install_validator=lambda _plan: None)
             self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old")
 
+    def _failed_restore_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            moves: dict[str, int] = {"backup": 0, "install": 0, "restore": 0}
+
+            def fail_install_and_restore(source, destination):
+                source, destination = Path(source), Path(destination)
+                if source == artifact.destination and destination == artifact.backup_path:
+                    moves["backup"] += 1
+                elif source == artifact.staged_path and destination == artifact.destination:
+                    moves["install"] += 1
+                    raise PermissionError("install locked")
+                elif source == artifact.backup_path and destination == artifact.destination:
+                    moves["restore"] += 1
+                    raise PermissionError("restore locked")
+                os.replace(source, destination)
+
+            with self.assertRaises(InstallError) as raised:
+                UpdateExecutor(
+                    plan,
+                    downloader=FakeDownloader(contents),
+                    replace_file=fail_install_and_restore,
+                ).execute(post_install_validator=lambda _plan: None)
+            self.assertEqual(moves, {"backup": 1, "install": 1, "restore": 1})
+            return (
+                raised.exception,
+                str(artifact.destination),
+                str(artifact.backup_path),
+                artifact.backup_path.read_bytes(),
+                json.loads(plan.manifest_path.read_text(encoding="utf-8")),
+            )
+
+    def test_failed_restore_keeps_original_reachable(self) -> None:
+        error, destination, backup, original, _manifest = self._failed_restore_case()
+        self.assertEqual(original, b"old")
+        self.assertIn(destination, str(error))
+        self.assertIn(backup, str(error))
+        self.assertIn("restore locked", str(error))
+
+    def test_failed_restore_names_required_recovery(self) -> None:
+        _error, destination, backup, _original, manifest = self._failed_restore_case()
+        self.assertEqual(manifest["phase"], "recovery-required")
+        self.assertIn(destination, manifest["error"])
+        self.assertIn(backup, manifest["error"])
+        self.assertEqual(manifest["artifacts"][0]["destination"], destination)
+
+    def test_restore_failure_is_not_swallowed(self) -> None:
+        error, _destination, _backup, _original, _manifest = self._failed_restore_case()
+        self.assertIsInstance(error, InstallError)
+
+    def test_locked_file_guidance_survives_restore_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])
+            artifact = plan.artifacts[0]
+            install_moves = 0
+
+            def fail_install(source, destination):
+                nonlocal install_moves
+                if Path(source) == artifact.staged_path and Path(destination) == artifact.destination:
+                    install_moves += 1
+                    raise PermissionError("locked")
+                os.replace(source, destination)
+
+            with self.assertRaises(InstallError) as raised:
+                UpdateExecutor(
+                    plan,
+                    downloader=FakeDownloader(contents),
+                    replace_file=fail_install,
+                ).execute(post_install_validator=lambda _plan: None)
+            self.assertEqual(install_moves, 1)
+            self.assertIn("Unload the model in LM Studio", str(raised.exception))
+            self.assertIsInstance(raised.exception.__cause__, PermissionError)
+
     def test_cancellation_before_commit_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, plan, contents = self.make_plan(Path(tmp), [("model.gguf", b"old", b"new")])

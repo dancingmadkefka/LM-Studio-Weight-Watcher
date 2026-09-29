@@ -63,6 +63,10 @@ class InstallError(UpdateError):
     """Verified bytes could not be transactionally installed."""
 
 
+class _RestoreFailure(InstallError):
+    """The original remains in its rollback path and needs recovery."""
+
+
 class UpdateCancelled(UpdateError):
     """The caller cancelled before installation began."""
 
@@ -719,16 +723,21 @@ class UpdateExecutor:
                     if had_original:
                         self._replace_file(artifact.destination, artifact.backup_path)
                     self._replace_file(artifact.staged_path, artifact.destination)
-                except PermissionError as exc:
-                    if had_original and artifact.backup_path.exists() and not artifact.destination.exists():
-                        self._replace_file(artifact.backup_path, artifact.destination)
-                    raise InstallError(
-                        f"Model file is in use: {artifact.destination}. "
-                        "Unload the model in LM Studio and retry."
-                    ) from exc
                 except OSError as exc:
                     if had_original and artifact.backup_path.exists() and not artifact.destination.exists():
-                        self._replace_file(artifact.backup_path, artifact.destination)
+                        try:
+                            self._replace_file(artifact.backup_path, artifact.destination)
+                        except OSError as restore_exc:
+                            raise _RestoreFailure(
+                                f"Could not restore {artifact.destination} from "
+                                f"{artifact.backup_path} after install failed: {exc}; "
+                                f"restore failed: {restore_exc}"
+                            ) from restore_exc
+                    if isinstance(exc, PermissionError):
+                        raise InstallError(
+                            f"Model file is in use: {artifact.destination}. "
+                            "Unload the model in LM Studio and retry."
+                        ) from exc
                     raise InstallError(f"Could not install {artifact.destination}: {exc}") from exc
                 installed.append((artifact, had_original))
                 self._emit(
@@ -848,7 +857,7 @@ class UpdateExecutor:
                     raise InstallError(message) from exc
             write_manifest(
                 self.plan,
-                "failed",
+                "recovery-required" if isinstance(exc, _RestoreFailure) else "failed",
                 error=str(exc),
                 owned_staging_files=owned_staging_files,
             )

@@ -380,6 +380,117 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(plan.artifacts[0].destination.read_bytes(), b"old-one")
             self.assertEqual(plan.artifacts[1].destination.read_bytes(), b"old-two")
 
+    def test_rollback_attempts_backup_restore_after_move_back_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old-one", b"new-one"), ("two.gguf", b"old-two", b"new-two")]
+            )
+            first = plan.artifacts[0]
+            parked = first.staged_path.with_name(first.staged_path.name + ".rollback")
+            failed_moves = 0
+
+            def fail_move_back(source, destination):
+                nonlocal failed_moves
+                if Path(source) == parked and Path(destination) == first.staged_path:
+                    failed_moves += 1
+                    raise OSError("stage move failed")
+                os.replace(source, destination)
+
+            with self.assertRaisesRegex(InstallError, "stage move failed"):
+                UpdateExecutor(
+                    plan, downloader=FakeDownloader(contents), replace_file=fail_move_back
+                ).execute(post_install_validator=lambda _plan: (_ for _ in ()).throw(RuntimeError("invalid")))
+            self.assertEqual(failed_moves, 1)
+            self.assertEqual(first.destination.read_bytes(), b"old-one")
+            self.assertEqual(plan.artifacts[1].destination.read_bytes(), b"old-two")
+
+    def _run_partial_rollback(self, base: Path):
+        _root, plan, contents = self.make_plan(
+            base, [("one.gguf", b"old-one", b"new-one"), ("two.gguf", b"old-two", b"new-two")]
+        )
+        failed = plan.artifacts[1]
+        restore_attempts = 0
+
+        def fail_one_restore(source, destination):
+            nonlocal restore_attempts
+            if Path(source) == failed.backup_path and Path(destination) == failed.destination:
+                restore_attempts += 1
+                raise OSError("restore failed")
+            os.replace(source, destination)
+
+        with self.assertRaises(InstallError) as raised:
+            UpdateExecutor(
+                plan, downloader=FakeDownloader(contents), replace_file=fail_one_restore
+            ).execute(post_install_validator=lambda _plan: (_ for _ in ()).throw(RuntimeError("invalid")))
+        self.assertEqual(restore_attempts, 1)
+        return plan, raised.exception
+
+    def test_rollback_reports_artifact_level_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, error = self._run_partial_rollback(Path(tmp))
+            self.assertIn("restore failed", str(error))
+            manifest = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["phase"], "recovery-required")
+            statuses = {entry["destination"]: entry for entry in manifest["rollback_status"]}
+            first, second = plan.artifacts
+            self.assertEqual(statuses[str(first.destination)]["backup_path"], str(first.backup_path))
+            self.assertTrue(statuses[str(first.destination)]["original_restored"])
+            self.assertEqual(statuses[str(second.destination)]["backup_path"], str(second.backup_path))
+            self.assertFalse(statuses[str(second.destination)]["original_restored"])
+            self.assertEqual(first.destination.read_bytes(), b"old-one")
+            self.assertEqual(second.backup_path.read_bytes(), b"old-two")
+
+    def test_partial_rollback_is_not_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, error = self._run_partial_rollback(Path(tmp))
+            self.assertIsInstance(error, InstallError)
+            self.assertTrue(plan.manifest_path.exists())
+
+    def test_rollback_restores_every_artifact_on_full_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old-one", b"new-one"), ("two.gguf", b"old-two", b"new-two")]
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalid"):
+                UpdateExecutor(plan, downloader=FakeDownloader(contents)).execute(
+                    post_install_validator=lambda _plan: (_ for _ in ()).throw(RuntimeError("invalid"))
+                )
+            self.assertEqual([a.destination.read_bytes() for a in plan.artifacts], [b"old-one", b"old-two"])
+
+    def test_partial_install_move_is_included_in_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, plan, contents = self.make_plan(
+                Path(tmp), [("one.gguf", b"old-one", b"new-one"), ("two.gguf", b"old-two", b"new-two")]
+            )
+            second = plan.artifacts[1]
+            injected = 0
+
+            def move_then_fail(source, destination):
+                nonlocal injected
+                os.replace(source, destination)
+                if Path(source) == second.staged_path and Path(destination) == second.destination:
+                    injected += 1
+                    raise OSError("failed after move")
+
+            with self.assertRaisesRegex(InstallError, "failed after move"):
+                UpdateExecutor(
+                    plan, downloader=FakeDownloader(contents), replace_file=move_then_fail
+                ).execute(post_install_validator=lambda _plan: None)
+            self.assertEqual(injected, 1)
+            self.assertEqual([a.destination.read_bytes() for a in plan.artifacts], [b"old-one", b"old-two"])
+
+    def test_recovery_restores_from_partial_rollback_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "models"
+            plan, _error = self._run_partial_rollback(Path(tmp))
+            failed = plan.artifacts[1]
+            if failed.destination.exists():
+                failed.destination.unlink()
+            actions = recover_interrupted_jobs(root)
+            self.assertEqual(failed.destination.read_bytes(), b"old-two")
+            self.assertEqual(failed.backup_path.read_bytes(), b"old-two")
+            self.assertTrue(any(action.action == "restored" and action.path == str(failed.destination) for action in actions))
+
     def test_partial_install_failure_rolls_back_prior_replacements(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _root, plan, contents = self.make_plan(
@@ -621,6 +732,7 @@ class RecoveryTests(unittest.TestCase):
             actions = recover_interrupted_jobs(root)
 
             self.assertEqual(target.read_bytes(), b"old")
+            self.assertEqual(plan.artifacts[0].backup_path.read_bytes(), b"old")
             self.assertEqual(actions[0].action, "restored")
 
 

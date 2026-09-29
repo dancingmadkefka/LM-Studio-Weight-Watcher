@@ -495,6 +495,7 @@ def write_manifest(
     *,
     error: str | None = None,
     owned_staging_files: Iterable[Path] = (),
+    rollback_status: Iterable[dict[str, Any]] = (),
 ) -> None:
     payload = {
         "version": MANIFEST_VERSION,
@@ -505,6 +506,7 @@ def write_manifest(
         "error": redact_sensitive(error) if error else None,
         "owned_staging_files": sorted(str(Path(path).resolve()) for path in owned_staging_files),
         "artifacts": [artifact.manifest_dict() for artifact in plan.artifacts],
+        "rollback_status": list(rollback_status),
     }
     _write_json_atomic(plan.manifest_path, payload)
 
@@ -657,6 +659,7 @@ class UpdateExecutor:
 
     def execute(self, *, post_install_validator: Callable[[UpdatePlan], None]) -> UpdateResult:
         installed: list[tuple[UpdateArtifact, bool]] = []
+        pending_install: tuple[UpdateArtifact, bool] | None = None
         owned_staging_files = self._load_owned_staging_files()
         hash_cache_snapshot = None
         write_manifest(
@@ -719,6 +722,7 @@ class UpdateExecutor:
                         f"Rollback path already exists; recovery is required: {artifact.backup_path}"
                     )
                 had_original = artifact.destination.exists()
+                pending_install = (artifact, had_original)
                 try:
                     if had_original:
                         self._replace_file(artifact.destination, artifact.backup_path)
@@ -733,6 +737,7 @@ class UpdateExecutor:
                                 f"{artifact.backup_path} after install failed: {exc}; "
                                 f"restore failed: {restore_exc}"
                             ) from restore_exc
+                        pending_install = None
                     if isinstance(exc, PermissionError):
                         raise InstallError(
                             f"Model file is in use: {artifact.destination}. "
@@ -740,6 +745,7 @@ class UpdateExecutor:
                         ) from exc
                     raise InstallError(f"Could not install {artifact.destination}: {exc}") from exc
                 installed.append((artifact, had_original))
+                pending_install = None
                 self._emit(
                     "installing",
                     f"Installed {artifact.label}",
@@ -835,6 +841,19 @@ class UpdateExecutor:
             self._emit("cancelled", str(exc), cancellable=False)
             raise
         except Exception as exc:
+            rollback_status: list[dict[str, Any]] = []
+            if pending_install is not None:
+                artifact, had_original = pending_install
+                if isinstance(exc, _RestoreFailure):
+                    rollback_status.append({
+                        "destination": str(artifact.destination),
+                        "backup_path": str(artifact.backup_path),
+                        "original_restored": False,
+                    })
+                elif artifact.backup_path.exists() or (
+                    not had_original and artifact.destination.exists() and not artifact.staged_path.exists()
+                ):
+                    installed.append(pending_install)
             if installed:
                 write_manifest(
                     self.plan,
@@ -842,7 +861,8 @@ class UpdateExecutor:
                     error=str(exc),
                     owned_staging_files=owned_staging_files,
                 )
-                rollback_errors = self._rollback(installed)
+                rollback_errors, completed_status = self._rollback(installed)
+                rollback_status.extend(completed_status)
                 if hash_cache_snapshot is not None and self.hash_cache is not None:
                     self.hash_cache.clear()
                     self.hash_cache.update(hash_cache_snapshot)
@@ -853,6 +873,7 @@ class UpdateExecutor:
                         "recovery-required",
                         error=message,
                         owned_staging_files=owned_staging_files,
+                        rollback_status=rollback_status,
                     )
                     raise InstallError(message) from exc
             write_manifest(
@@ -860,22 +881,58 @@ class UpdateExecutor:
                 "recovery-required" if isinstance(exc, _RestoreFailure) else "failed",
                 error=str(exc),
                 owned_staging_files=owned_staging_files,
+                rollback_status=rollback_status,
             )
             self._emit("failed", redact_sensitive(exc), cancellable=False)
             raise
 
-    def _rollback(self, installed: list[tuple[UpdateArtifact, bool]]) -> list[str]:
+    def _rollback(
+        self, installed: list[tuple[UpdateArtifact, bool]]
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         errors: list[str] = []
+        statuses: list[dict[str, Any]] = []
         for artifact, had_original in reversed(installed):
-            try:
+            original_restored = False
+            parked = artifact.staged_path.with_name(artifact.staged_path.name + ".rollback")
+            if had_original:
+                # Park the new bytes first, then restore the original before
+                # moving the parked bytes back to staging.
                 if artifact.destination.exists():
+                    try:
+                        artifact.staged_path.parent.mkdir(parents=True, exist_ok=True)
+                        if parked.exists():
+                            raise OSError(f"Rollback staging path already exists: {parked}")
+                        self._replace_file(artifact.destination, parked)
+                    except OSError as exc:
+                        errors.append(f"Could not park {artifact.destination}: {exc}")
+                if artifact.backup_path.exists():
+                    try:
+                        self._replace_file(artifact.backup_path, artifact.destination)
+                        original_restored = True
+                    except OSError as exc:
+                        errors.append(f"Could not restore {artifact.destination} from {artifact.backup_path}: {exc}")
+                else:
+                    errors.append(f"Missing rollback file for {artifact.destination}: {artifact.backup_path}")
+                if parked.exists():
+                    try:
+                        self._replace_file(parked, artifact.staged_path)
+                    except OSError as exc:
+                        errors.append(f"Could not return {parked} to staging: {exc}")
+            elif artifact.destination.exists():
+                try:
                     artifact.staged_path.parent.mkdir(parents=True, exist_ok=True)
                     self._replace_file(artifact.destination, artifact.staged_path)
-                if had_original and artifact.backup_path.exists():
-                    self._replace_file(artifact.backup_path, artifact.destination)
-            except OSError as exc:
-                errors.append(f"{artifact.destination}: {exc}")
-        return errors
+                    original_restored = True
+                except OSError as exc:
+                    errors.append(f"Could not remove new file {artifact.destination}: {exc}")
+            else:
+                original_restored = True
+            statuses.append({
+                "destination": str(artifact.destination),
+                "backup_path": str(artifact.backup_path),
+                "original_restored": original_restored,
+            })
+        return errors, statuses
 
     def _load_owned_staging_files(self) -> set[Path]:
         if not self.plan.manifest_path.is_file():
@@ -973,7 +1030,7 @@ def recover_interrupted_jobs(models_root: Path) -> list[RecoveryAction]:
                 continue
             if not destination.exists() and backup.is_file():
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(backup, destination)
+                shutil.copy2(backup, destination)
                 actions.append(RecoveryAction(job_id, "restored", str(destination), "Restored missing destination from rollback."))
             elif backup.exists():
                 actions.append(RecoveryAction(job_id, "reported", str(backup), "Destination and rollback both exist; manual inspection required."))

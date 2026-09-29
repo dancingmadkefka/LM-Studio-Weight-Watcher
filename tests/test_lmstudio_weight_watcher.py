@@ -200,6 +200,89 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.maybe_raise_pending_window = Mock()
         return app
 
+    def detail_content(self, app: WatcherApp) -> str:
+        return "".join(call.args[1] for call in app.detail_text.insert.call_args_list)
+
+    def test_render_detail_without_artifacts(self) -> None:
+        app = self.make_app()
+        app.detail_text = Mock()
+        app._render_detail({
+            "model_key": "model", "display_name": "Test Model",
+            "remote_repo": "org/repo", "remote_file": "model.gguf",
+            "local_path": "C:/models/model.gguf", "artifacts": [],
+            "last_commit_title": "Update model",
+        })
+        detail = self.detail_content(app)
+        self.assertIn("Model: Test Model", detail)
+        self.assertIn("Repository: org/repo", detail)
+        self.assertIn("Last upstream commit: Update model", detail)
+        self.assertNotIn("Files checked", detail)
+        app.detail_text.configure.assert_any_call(state=tk.DISABLED)
+
+    def test_render_detail_removed_remote_with_suggestions(self) -> None:
+        app = self.make_app()
+        app.detail_text = Mock()
+        app._render_detail({
+            "model_key": "removed", "display_name": "Removed Model",
+            "remote_repo": "org/repo", "remote_file": "missing.gguf",
+            "local_path": "C:/models/missing.gguf",
+            "check_status": "removed-remote",
+            "artifacts": [{"status": "removed-remote", "label": "missing.gguf"}],
+            "suggestions": ["model-Q4.gguf"],
+        })
+        detail = self.detail_content(app)
+        self.assertIn("[removed-remote] missing.gguf", detail)
+        self.assertIn("This exact file was deleted upstream", detail)
+        self.assertIn("Upstream still offers these quants", detail)
+        self.assertIn("model-Q4.gguf", detail)
+
+    def test_render_detail_missing_local_shows_expected_destination(self) -> None:
+        app = self.make_app()
+        app.detail_text = Mock()
+        expected = "C:/models/expected.gguf"
+        app._render_detail({
+            "model_key": "missing", "display_name": "Missing Local Model",
+            "remote_repo": "org/repo", "remote_file": "expected.gguf",
+            "local_path": expected, "check_status": "update-available",
+            "artifacts": [{"status": "missing-local", "label": "expected.gguf"}],
+        })
+        detail = self.detail_content(app)
+        self.assertIn(f"Local file: {expected}", detail)
+        self.assertIn("[missing-local] expected.gguf", detail)
+        self.assertNotIn("deleted upstream", detail)
+
+    def test_on_tree_select_without_selection(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ()
+        app.selection_var = Mock()
+        app.detail_text = Mock()
+        app._refresh_action_states = Mock()
+        app._on_tree_select()
+        app.selection_var.set.assert_called_once_with("No selection")
+        self.assertIn("Select a row to see the source", self.detail_content(app))
+        app._refresh_action_states.assert_called_once()
+
+    def test_on_tree_select_resolves_selected_alert(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ("model",)
+        app._alerts_by_key = {
+            "model": {
+                "model_key": "model", "display_name": "Selected Model",
+                "remote_repo": "org/repo", "remote_file": "selected.gguf",
+                "local_path": "C:/models/selected.gguf",
+            }
+        }
+        app.selection_var = Mock()
+        app.detail_text = Mock()
+        app._refresh_action_states = Mock()
+        app._on_tree_select()
+        app.selection_var.set.assert_called_once_with("1 model selected")
+        self.assertIn("Model: Selected Model", self.detail_content(app))
+        self.assertIn("Local file: C:/models/selected.gguf", self.detail_content(app))
+        app._refresh_action_states.assert_called_once()
+
     def test_startup_recovery_runs_in_background(self) -> None:
         app = self.make_app()
         worker = Mock()

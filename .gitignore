@@ -13,6 +13,7 @@ env/
 .cursor/workflow-state.json
 .cursor/reviews/
 .cursor/evidence/
+.agent-build/
 
 # Local runtime state
 *.log

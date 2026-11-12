@@ -15,6 +15,7 @@ from pathlib import Path
 import tkinter as tk  
 from tkinter import ttk, font as tkfont, messagebox
   
+from watcher_toasts import WatchToaster
 from lmstudio_alert_state import (
     LEGACY_APP_NAME,
     acknowledge_alerts,
@@ -356,9 +357,9 @@ class WatcherApp:
         self.quit_after_update = False
         self.shutting_down = False  
         self.next_check_token = None  
-        self.topmost_reset_token = None  
         self.window = None  
         self.tree = None  
+        self.toaster = WatchToaster()  
   
         self.root = tk.Tk()  
         self.root.withdraw()  
@@ -428,7 +429,7 @@ class WatcherApp:
         return f"{pending_count} pending · {checked} models tracked"  
   
     def on_open_alerts(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  
-        self.root.after(0, lambda: self.show_window(force_topmost=True))  
+        self.root.after(0, self.show_window)  
   
     def on_check_now(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  
         self.root.after(0, lambda: self.run_check_async(reschedule=True))  
@@ -710,10 +711,17 @@ class WatcherApp:
             details.extend(["", "Upstream changes:"])
             details.extend(f"• {title}" for title in commit_titles)
         try:
+            if self.window is None or not self.window.winfo_exists():
+                # Tray path (Update All from the tray menu) with no window
+                # open: build one so the confirmation dialog is parented to
+                # a real window instead of floating parentless over the
+                # withdrawn root. The new window maps by normal WM rules
+                # only — the user just acted, so showing it is expected.
+                self.create_window()
             confirmed = messagebox.askyesno(
                 "Confirm model update",
                 "\n".join(details),
-                parent=self.window if self.window and self.window.winfo_exists() else None,
+                parent=self.window,
             )
         except tk.TclError as exc:
             self.update_in_progress = False
@@ -916,54 +924,66 @@ class WatcherApp:
         self.refresh_ui()
   
     def maybe_raise_pending_window(self, *, force: bool) -> None:  
+        """Background reminder path: toast only, never steal focus/raise a window.
+
+        Kept name for compatibility; the window is only ever shown by explicit
+        user action (tray menu / tray click). One toast per alert-state change
+        (deduped by WatchToaster), gated by the same reminder cadence as before.
+        """
         now_utc = datetime.now(timezone.utc)  
         if force or reminder_due(  
             self.state,  
             now_utc=now_utc,  
             reminder_interval=self.reminder_interval,  
         ):  
-            self.show_window(force_topmost=True)  
-            self.root.bell()  
+            alerts = pending_alerts(self.state, now_utc)  
+            alert_key = tuple(  
+                (alert.get("model_key"), alert.get("check_status"))  
+                for alert in alerts  
+            )  
+            if alerts:  
+                names = ", ".join(  
+                    str(alert.get("display_name") or alert.get("model_key") or "?")  
+                    for alert in alerts[:3]  
+                )  
+                if len(alerts) > 3:  
+                    names += f" (+{len(alerts) - 3} more)"  
+                updates = sum(  
+                    1 for alert in alerts if alert.get("check_status") == "update-available"  
+                )  
+                removed = len(alerts) - updates  
+                parts = [f"{len(alerts)} pending"]  
+                if updates:  
+                    parts.append(f"{updates} update(s) available")  
+                if removed:  
+                    parts.append(f"{removed} removed upstream")  
+                body = f"{names}: {' · '.join(parts)}. Open the tray icon to act."  
+                self.toaster.notify(alert_key, body)  
+            else:  
+                self.toaster.clear()  
             self.state = record_reminder(self.state, now_utc)  
             save_state(self.state_path, self.state)  
   
     # ----- Window -----  
   
-    def show_window(self, *, force_topmost: bool) -> None:  
+    def show_window(self) -> None:  
+        """Show the alerts window. User-action-only (tray menu / tray click).
+
+        Never steals focus or forces itself on top: the window appears when the
+        user asks for it and takes focus only by normal WM rules.
+        """
         if self.shutting_down:  
             return  
         if self.window is None or not self.window.winfo_exists():  
             self.create_window()  
-  
         assert self.window is not None  
         self.refresh_tree()  
         self.window.deiconify()  
         self.window.lift()  
-        if force_topmost:  
-            self.window.attributes("-topmost", True)  
-            self._schedule_topmost_reset()  
-        self.window.focus_force()  
-  
+
     def hide_window(self) -> None:  
         if self.window and self.window.winfo_exists():  
             self.window.withdraw()  
-
-    def _schedule_topmost_reset(self) -> None:  
-        if self.window is None or not self.window.winfo_exists():  
-            return  
-        if self.topmost_reset_token is not None:  
-            try:  
-                self.window.after_cancel(self.topmost_reset_token)  
-            except tk.TclError:  
-                pass  
-            self.topmost_reset_token = None  
-        self.topmost_reset_token = self.window.after(1500, self._clear_topmost)  
-
-    def _clear_topmost(self) -> None:  
-        self.topmost_reset_token = None  
-        if self.shutting_down or self.window is None or not self.window.winfo_exists():  
-            return  
-        self.window.attributes("-topmost", False)  
   
     def _configure_styles(self) -> None:  
         style = ttk.Style(self.window)  
@@ -1792,12 +1812,6 @@ class WatcherApp:
             if cancellation is not None:
                 cancellation.cancel()
         self.shutting_down = True  
-        if self.topmost_reset_token is not None and self.window and self.window.winfo_exists():  
-            try:  
-                self.window.after_cancel(self.topmost_reset_token)  
-            except tk.TclError:  
-                pass  
-            self.topmost_reset_token = None  
         if self.next_check_token is not None:  
             try:  
                 self.root.after_cancel(self.next_check_token)  

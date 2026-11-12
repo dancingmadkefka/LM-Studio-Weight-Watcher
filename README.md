@@ -22,16 +22,36 @@ powershell -ExecutionPolicy Bypass -File .\install_startup_task.ps1
 
 ## Daily use
 
-When a check finds changes, the alerts window opens with one row per model.
-Update Selected and Update All Pending show a confirmation first: which models
-and files, how many bytes, free space, upstream commit titles. Downloads can be
-cancelled until the final swap. If LM Studio still has a file open, the row
-shows "Waiting for model unload"; unload the model and retry.
+The tray icon shows the state: a green check when everything matches, a red
+count when updates wait, amber when files were only removed upstream, blue
+dots while it works. When a check finds something new, Windows shows a
+notification. Click the tray icon to open the window.
 
-If a file was deleted upstream, the alert lists the quants that still exist in
-the repo.
+The window lists every model that needs attention. Click one to see where it
+comes from, what changed upstream, and where it lives on disk. Filters at the
+top split the list into Needs attention, Snoozed, Dismissed, and Can't check.
 
-Alerts can be acknowledged or snoozed.
+The buttons at the bottom act on the selected models, or on everything pending
+when nothing is selected:
+
+- **Update** opens a confirmation that lists the models, files, download
+  size, free disk space and upstream commit titles. Nothing downloads before
+  you confirm. A progress bar with speed and time left replaces it, and you
+  can cancel until installation starts.
+- **Snooze** hides models for 4 hours.
+- **Dismiss** hides models until their files change upstream again.
+
+Snooze and Dismiss can be undone from the status line. Right-click a model for
+more: move it back to Needs attention, open it on Hugging Face, show the file
+in Explorer, copy its details.
+
+If LM Studio still has a file open, the update stops and asks you to unload
+the model; Try again picks it up. If a file was deleted upstream, the details
+list the quants the repository still offers.
+
+Keyboard: F5 checks now, Enter updates, Delete dismisses, Esc clears the
+selection or hides the window. The window follows the Windows light or dark
+setting; set `LMSTUDIO_WATCHER_THEME=light` or `dark` to override it.
 
 ## Scripts
 

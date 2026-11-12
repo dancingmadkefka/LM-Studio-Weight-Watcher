@@ -15,13 +15,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from lmstudio_alert_state import load_state
+from lmstudio_alert_state import (
+    acknowledge_alerts,
+    load_state,
+    restore_alerts,
+    set_alert_statuses,
+    snooze_alerts,
+)
 from lmstudio_weight_watcher import (
     CheckOutcome,
     DependencyPreflightResult,
     RecoveryWorkerOutcome,
     UpdateWorkerOutcome,
     WatcherApp,
+    alert_kind,
+    alert_sort_key,
+    filter_matches,
+    fit_text,
     format_alert_detail,
     hf_file_url,
     hf_repo_url,
@@ -213,10 +223,11 @@ class WatcherLifecycleTests(unittest.TestCase):
             "last_commit_title": "Update model",
         })
         detail = self.detail_content(app)
-        self.assertIn("Model: Test Model", detail)
-        self.assertIn("Repository: org/repo", detail)
-        self.assertIn("Last upstream commit: Update model", detail)
-        self.assertNotIn("Files checked", detail)
+        self.assertIn("Test Model\n", detail)
+        self.assertIn("Repository\norg/repo", detail)
+        self.assertIn("Last upstream commit\n\u201cUpdate model\u201d", detail)
+        self.assertIn("Local file\nC:/models/model.gguf", detail)
+        self.assertNotIn("FILES CHECKED", detail)
         app.detail_text.configure.assert_any_call(state=tk.DISABLED)
 
     def test_render_detail_removed_remote_with_suggestions(self) -> None:
@@ -231,8 +242,9 @@ class WatcherLifecycleTests(unittest.TestCase):
             "suggestions": ["model-Q4.gguf"],
         })
         detail = self.detail_content(app)
-        self.assertIn("[removed-remote] missing.gguf", detail)
+        self.assertIn("missing.gguf \u2014 deleted upstream, local copy kept", detail)
         self.assertIn("This exact file was deleted upstream", detail)
+        self.assertIn("updating is not offered", detail)
         self.assertIn("Upstream still offers these quants", detail)
         self.assertIn("model-Q4.gguf", detail)
 
@@ -247,8 +259,9 @@ class WatcherLifecycleTests(unittest.TestCase):
             "artifacts": [{"status": "missing-local", "label": "expected.gguf"}],
         })
         detail = self.detail_content(app)
-        self.assertIn(f"Local file: {expected}", detail)
-        self.assertIn("[missing-local] expected.gguf", detail)
+        self.assertIn(f"Local file\n{expected}", detail)
+        self.assertIn("expected.gguf \u2014 missing on this PC", detail)
+        self.assertIn("A file this model needs is missing on this PC", detail)
         self.assertNotIn("deleted upstream", detail)
 
     def test_on_tree_select_without_selection(self) -> None:
@@ -260,7 +273,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         app._refresh_action_states = Mock()
         app._on_tree_select()
         app.selection_var.set.assert_called_once_with("No selection")
-        self.assertIn("Select a row to see the source", self.detail_content(app))
+        self.assertIn("Select a model to see the source", self.detail_content(app))
         app._refresh_action_states.assert_called_once()
 
     def test_on_tree_select_resolves_selected_alert(self) -> None:
@@ -279,8 +292,8 @@ class WatcherLifecycleTests(unittest.TestCase):
         app._refresh_action_states = Mock()
         app._on_tree_select()
         app.selection_var.set.assert_called_once_with("1 model selected")
-        self.assertIn("Model: Selected Model", self.detail_content(app))
-        self.assertIn("Local file: C:/models/selected.gguf", self.detail_content(app))
+        self.assertIn("Selected Model\n", self.detail_content(app))
+        self.assertIn("Local file\nC:/models/selected.gguf", self.detail_content(app))
         app._refresh_action_states.assert_called_once()
 
     def test_startup_recovery_runs_in_background(self) -> None:
@@ -354,11 +367,15 @@ class WatcherLifecycleTests(unittest.TestCase):
             app.finish_recovery(RecoveryWorkerOutcome(Path("models"), [action], None))
             app.state = load_state(app.state_path)
             self.assertTrue(app.state["recovery_notice"]["attention"])
-            app.unresolved_text = Mock()
-            app._refresh_unresolved()
-            inserted = [call.args[1] for call in app.unresolved_text.insert.call_args_list]
-            self.assertIn("Recovery\n", inserted)
-            self.assertIn(app.state["recovery_notice"]["message"] + "\n", inserted)
+            app.last_models_root = Path("models")
+            specs = app._banner_specs()
+            recovery = [spec for spec in specs if spec["key"] == "recovery"]
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0]["kind"], "danger")
+            self.assertEqual(recovery[0]["message"], app.state["recovery_notice"]["message"])
+            app.refresh_ui = Mock()
+            recovery[0]["on_close"]()
+            self.assertNotIn("recovery_notice", load_state(app.state_path))
 
     def test_recovery_message_survives_following_check(self) -> None:
         app = self.make_app()
@@ -517,7 +534,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.update_model_status = {"model": "Queued"}
         self.stub_create_window(app)
         with (
-            patch("lmstudio_weight_watcher.messagebox.askyesno", return_value=False),
+            patch("lmstudio_weight_watcher.ask_update_confirmation", return_value=False),
             patch("lmstudio_weight_watcher.threading.Thread") as thread,
         ):
             app.finish_prepare_update(self.make_plan(), None)
@@ -534,7 +551,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         self.stub_create_window(app)
         worker = Mock()
         with (
-            patch("lmstudio_weight_watcher.messagebox.askyesno", return_value=True),
+            patch("lmstudio_weight_watcher.ask_update_confirmation", return_value=True),
             patch("lmstudio_weight_watcher.threading.Thread") as thread,
             patch("lmstudio_weight_watcher.save_state") as save_state,
         ):
@@ -553,7 +570,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.update_model_status = {"model": "Queued"}
         self.stub_create_window(app)
         with patch(
-            "lmstudio_weight_watcher.messagebox.askyesno",
+            "lmstudio_weight_watcher.ask_update_confirmation",
             side_effect=tk.TclError("window destroyed"),
         ):
             app.finish_prepare_update(self.make_plan(), None)
@@ -573,13 +590,13 @@ class WatcherLifecycleTests(unittest.TestCase):
         window = self.stub_create_window(app)
         with (
             patch(
-                "lmstudio_weight_watcher.messagebox.askyesno", return_value=False
-            ) as askyesno,
+                "lmstudio_weight_watcher.ask_update_confirmation", return_value=False
+            ) as ask,
             patch("lmstudio_weight_watcher.threading.Thread") as thread,
         ):
             app.finish_prepare_update(self.make_plan(), None)
         app.create_window.assert_called_once()
-        parent = askyesno.call_args.kwargs["parent"]
+        parent = ask.call_args.args[0]
         self.assertIsNotNone(parent)
         self.assertIs(parent, window)
         # No forbidden focus-steal API on the freshly created window.
@@ -774,13 +791,18 @@ class WatcherLifecycleTests(unittest.TestCase):
             },
         }
         app.check_button = Mock()
-        app.update_selected_button = Mock()
-        app.update_all_button = Mock()
+        app.update_button = Mock()
         app.cancel_update_button = Mock()
         app._refresh_action_states()
-        app.update_selected_button.configure.assert_called_once_with(state=tk.DISABLED)
-        app.update_all_button.configure.assert_called_once_with(state=tk.DISABLED)
-        app.check_button.configure.assert_called_once_with(state=tk.NORMAL)
+        app.update_button.configure.assert_any_call(state=tk.DISABLED)
+        app.check_button.configure.assert_any_call(state=tk.NORMAL)
+        # With nothing selected the same button covers every pending model,
+        # and removed-upstream models are never counted as updatable.
+        app.tree.selection.return_value = ()
+        app.update_button.reset_mock()
+        app._refresh_action_states()
+        app.update_button.configure.assert_any_call(state=tk.DISABLED)
+        app.update_button.configure.assert_any_call(text="Update all")
 
     def test_refresh_action_states_enables_update_for_updatable(self) -> None:
         app = self.make_app()
@@ -797,13 +819,36 @@ class WatcherLifecycleTests(unittest.TestCase):
             },
         }
         app.check_button = Mock()
-        app.update_selected_button = Mock()
-        app.update_all_button = Mock()
+        app.update_button = Mock()
         app.cancel_update_button = Mock()
         app._refresh_action_states()
-        app.update_selected_button.configure.assert_called_once_with(state=tk.NORMAL)
-        app.update_all_button.configure.assert_called_once_with(state=tk.NORMAL)
-        app.check_button.configure.assert_called_once_with(state=tk.NORMAL)
+        app.update_button.configure.assert_any_call(state=tk.NORMAL)
+        app.update_button.configure.assert_any_call(text="Update")
+        app.check_button.configure.assert_any_call(state=tk.NORMAL)
+        app.tree.selection.return_value = ()
+        app.update_button.reset_mock()
+        app._refresh_action_states()
+        app.update_button.configure.assert_any_call(state=tk.NORMAL)
+        app.update_button.configure.assert_any_call(text="Update all (1)")
+
+    def test_refresh_action_states_disables_update_while_busy(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ()
+        app.state["alerts"] = {
+            "updatable": {
+                "model_key": "updatable",
+                "status": "pending",
+                "check_status": "update-available",
+            },
+        }
+        app.check_in_progress = True
+        app.check_button = Mock()
+        app.update_button = Mock()
+        app._refresh_action_states()
+        app.update_button.configure.assert_any_call(state=tk.DISABLED)
+        app.check_button.configure.assert_any_call(state=tk.DISABLED)
+        app.check_button.configure.assert_any_call(text="Checking\u2026")
 
     def test_format_status_removed_remote_pending(self) -> None:
         app = self.make_app()
@@ -829,7 +874,7 @@ class WatcherLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(
             app._format_status(alert, "acknowledged", datetime.now(timezone.utc)),
-            "Removed upstream · acknowledged",
+            "Removed upstream \u00b7 dismissed",
         )
 
     def test_quit_defers_while_install_is_non_cancellable(self) -> None:
@@ -1026,6 +1071,308 @@ class WatcherLifecycleTests(unittest.TestCase):
         app.icon.stop.assert_called_once()
         app.root.quit.assert_called_once()
         app.root.destroy.assert_called_once()
+
+
+class WatcherPresentationTests(unittest.TestCase):
+    def make_app(self) -> WatcherApp:
+        app = object.__new__(WatcherApp)
+        app.state = {"alerts": {}, "active_update": None}
+        app.state_path = Path("test-state.json")
+        app.update_model_status = {}
+        app.update_in_progress = False
+        app.check_in_progress = False
+        app.recovery_in_progress = False
+        app.update_cancellable = False
+        app.update_commit_started = threading.Event()
+        app.last_models_root = None
+        app._alerts_by_key = {}
+        app.status_var = Mock()
+        app.refresh_ui = Mock()
+        return app
+
+    def test_sort_puts_updates_first_then_removed_snoozed_dismissed(self) -> None:
+        alerts = [
+            {"model_key": "d", "display_name": "D", "status": "acknowledged"},
+            {"model_key": "s", "display_name": "S", "status": "snoozed"},
+            {"model_key": "r", "display_name": "R", "status": "pending",
+             "check_status": "removed-remote"},
+            {"model_key": "u", "display_name": "U", "status": "pending",
+             "check_status": "update-available"},
+        ]
+        ordered = [a["model_key"] for a in sorted(alerts, key=alert_sort_key)]
+        self.assertEqual(ordered, ["u", "r", "s", "d"])
+
+    def test_filters(self) -> None:
+        pending = {"status": "pending"}
+        snoozed = {"status": "snoozed"}
+        dismissed = {"status": "acknowledged"}
+        self.assertTrue(filter_matches("all", dismissed))
+        self.assertTrue(filter_matches("attention", pending))
+        self.assertFalse(filter_matches("attention", snoozed))
+        self.assertTrue(filter_matches("snoozed", snoozed))
+        self.assertTrue(filter_matches("dismissed", dismissed))
+        self.assertFalse(filter_matches("unchecked", pending))
+
+    def test_alert_kind_prefers_live_update_status(self) -> None:
+        alert = {"status": "pending", "check_status": "update-available"}
+        self.assertEqual(alert_kind(alert), "update")
+        self.assertEqual(alert_kind(alert, "Downloading 40%"), "busy")
+        self.assertEqual(alert_kind(alert, "Waiting for model unload"), "failed")
+        self.assertEqual(alert_kind(alert, "Updated"), "ok")
+        self.assertEqual(alert_kind({"status": "pending", "check_status": "removed-remote"}), "removed")
+        self.assertEqual(alert_kind({"status": "snoozed"}), "snoozed")
+
+    def test_fit_text_adds_ellipsis_only_when_needed(self) -> None:
+        font = Mock()
+        font.measure.side_effect = lambda text: len(text) * 10
+        self.assertEqual(fit_text("short", font, 100), "short")
+        fitted = fit_text("a very long model name", font, 100)
+        self.assertTrue(fitted.endswith("\u2026"))
+        self.assertLessEqual(len(fitted) * 10, 100)
+
+    def test_tray_tooltip_fits_windows_limit(self) -> None:
+        app = self.make_app()
+        app.state["alerts"] = {
+            f"m{i}": {"model_key": f"m{i}", "status": "pending",
+                      "check_status": "update-available"}
+            for i in range(3)
+        }
+        app.state["last_checked_utc"] = "2026-01-01T00:00:00Z"
+        text = app.tray_tooltip_text()
+        self.assertIn("3 updates available", text)
+        self.assertLessEqual(len(text), 127)
+
+    def test_make_icon_image_kinds(self) -> None:
+        app = self.make_app()
+        with patch("lmstudio_weight_watcher.tray_icon_image") as image:
+            app.make_icon_image(0, busy=False)
+            app.make_icon_image(2, busy=False)
+            app.make_icon_image(1, busy=False, removed_only=True)
+            app.make_icon_image(2, busy=True)
+        kinds = [call.args[0] for call in image.call_args_list]
+        self.assertEqual(kinds, ["ok", "pending", "removed", "busy"])
+
+    def test_snooze_all_leaves_dismissed_alerts_alone(self) -> None:
+        app = self.make_app()
+        app.state["alerts"] = {
+            "p": {"model_key": "p", "status": "pending"},
+            "d": {"model_key": "d", "status": "acknowledged"},
+        }
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.snooze_all()
+        self.assertEqual(app.state["alerts"]["p"]["status"], "snoozed")
+        self.assertEqual(app.state["alerts"]["d"]["status"], "acknowledged")
+
+    def test_undo_restores_previous_statuses(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ("p", "s")
+        app.state["alerts"] = {
+            "p": {"model_key": "p", "status": "pending", "snoozed_until_utc": None},
+            "s": {"model_key": "s", "status": "snoozed",
+                  "snoozed_until_utc": "2030-01-01T00:00:00Z"},
+        }
+        app._alerts_by_key = dict(app.state["alerts"])
+        with patch("lmstudio_weight_watcher.save_state"):
+            app.acknowledge_selected()
+            self.assertEqual(app.state["alerts"]["p"]["status"], "acknowledged")
+            self.assertEqual(app.state["alerts"]["s"]["status"], "acknowledged")
+            app.undo_last_triage()
+        self.assertEqual(app.state["alerts"]["p"]["status"], "pending")
+        self.assertEqual(app.state["alerts"]["s"]["status"], "snoozed")
+        self.assertEqual(app.state["alerts"]["s"]["snoozed_until_utc"], "2030-01-01T00:00:00Z")
+
+    def test_failed_update_banner_offers_retry_for_still_updatable(self) -> None:
+        app = self.make_app()
+        app.state["alerts"] = {
+            "m": {"model_key": "m", "status": "pending", "check_status": "update-available"},
+        }
+        app.state["last_update"] = {
+            "job_id": "job-1", "model_keys": ["m"], "model_names": ["Model"],
+            "success": False, "cancelled": False,
+            "message": "Unload the model in LM Studio and try again.",
+            "completed_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        specs = app._banner_specs()
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["kind"], "warn")
+        self.assertIn("Unload Model in LM Studio", specs[0]["title"])
+        app.prepare_update_async = Mock()
+        specs[0]["actions"][0].command()
+        app.prepare_update_async.assert_called_once_with(["m"])
+        specs[0]["on_close"]()
+        self.assertEqual(app._banner_specs(), [])
+
+    def test_check_error_banner_is_redacted(self) -> None:
+        app = self.make_app()
+        app.state["last_error"] = "request failed with hf_token=secret123"
+        specs = app._banner_specs()
+        self.assertEqual(specs[0]["key"], "check-error")
+        self.assertNotIn("secret123", specs[0]["title"])
+
+    def test_progress_text_reports_rate_and_eta(self) -> None:
+        app = self.make_app()
+        first = ProgressEvent("downloading", "Downloading weights", artifact="weights",
+                              bytes_completed=0, bytes_total=100 * 1024 * 1024)
+        second = ProgressEvent("downloading", "Downloading weights", artifact="weights",
+                               bytes_completed=50 * 1024 * 1024, bytes_total=100 * 1024 * 1024)
+        with patch("lmstudio_weight_watcher.time.monotonic", side_effect=[100.0, 101.0]):
+            app._progress_text(first)
+            text = app._progress_text(second)
+        self.assertIn("50.0 MiB of 100.0 MiB", text)
+        self.assertIn("50.0 MiB/s", text)
+        self.assertIn("about 1 s left", text)
+
+    def test_unresolved_only_selection_never_acts_on_everything(self) -> None:
+        app = self.make_app()
+        app.tree = Mock()
+        app.tree.selection.return_value = ("unresolved::x",)
+        app.state["alerts"] = {
+            "p": {"model_key": "p", "status": "pending", "check_status": "update-available"},
+        }
+        app._alerts_by_key = dict(app.state["alerts"])
+        app.dismiss_button = Mock()
+        app.snooze_button = Mock()
+        app.update_button = Mock()
+        app._refresh_action_states()
+        app.dismiss_button.configure.assert_any_call(state=tk.DISABLED)
+        app.snooze_button.configure.assert_any_call(state=tk.DISABLED)
+        app.update_button.configure.assert_any_call(state=tk.DISABLED)
+        app.prepare_update_async = Mock()
+        with patch("lmstudio_weight_watcher.save_state"):
+            app._on_dismiss_clicked()
+            app._on_snooze_clicked()
+            app._on_update_clicked()
+        self.assertEqual(app.state["alerts"]["p"]["status"], "pending")
+        app.prepare_update_async.assert_not_called()
+
+    def test_destroy_window_forgets_window_widgets(self) -> None:
+        app = self.make_app()
+        app.window = Mock()
+        for name in WatcherApp._WINDOW_WIDGETS:
+            setattr(app, name, Mock())
+        app._destroy_window()
+        for name in WatcherApp._WINDOW_WIDGETS:
+            self.assertIsNone(getattr(app, name), name)
+        app.update_in_progress = True
+        app.update_cancellable = True
+        app._refresh_action_states()  # must not touch destroyed widgets
+
+
+class UpdateConfirmationDialogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:  # pragma: no cover - headless CI
+            self.skipTest(f"Tk unavailable: {exc}")
+        self.root.withdraw()
+        self.parent = tk.Toplevel(self.root)
+
+    def tearDown(self) -> None:
+        self.root.destroy()
+
+    def summary(self, models: int = 1, files: int = 1):
+        from watcher_ui import ConfirmModel, ConfirmSummary
+
+        return ConfirmSummary(
+            models=[
+                ConfirmModel(f"Model {i}", 1024, [f"shard {j}" for j in range(files)], "fix")
+                for i in range(models)
+            ],
+            download_bytes=1024, total_bytes=1024, available_bytes=4096, required_bytes=2048,
+        )
+
+    def run_dialog(self, action, summary=None) -> tuple[bool, dict]:
+        from watcher_ui import ask_update_confirmation
+
+        seen: dict = {}
+
+        def drive() -> None:
+            dialogs = [c for c in self.parent.winfo_children() if isinstance(c, tk.Toplevel)]
+            if not dialogs:
+                self.root.after(50, drive)
+                return
+            dialog = dialogs[0]
+            dialog.update_idletasks()
+            seen["height"] = dialog.winfo_reqheight()
+            seen["screen"] = dialog.winfo_screenheight()
+            action(dialog)
+
+        def give_up() -> None:
+            for child in self.parent.winfo_children():
+                if isinstance(child, tk.Toplevel):
+                    seen["timed_out"] = True
+                    child.destroy()
+
+        self.root.after(100, drive)
+        self.root.after(8000, give_up)
+        result = ask_update_confirmation(self.parent, self.summary() if summary is None else summary,
+                                         None, lambda n: f"{n} B")
+        return result, seen
+
+    @staticmethod
+    def buttons(dialog) -> dict:
+        found = {}
+        stack = list(dialog.winfo_children())
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
+            if isinstance(widget, tk.ttk.Button):
+                found[widget.cget("text")] = widget
+        return found
+
+    def test_enter_on_cancel_does_not_confirm(self) -> None:
+        def press_enter_on_cancel(dialog) -> None:
+            self.buttons(dialog)["Cancel"].focus_set()
+            dialog.update()
+            dialog._lmww_on_return()
+
+        result, seen = self.run_dialog(press_enter_on_cancel)
+        self.assertNotIn("timed_out", seen)
+        self.assertFalse(result)
+
+    def test_enter_on_default_button_confirms(self) -> None:
+        def press_enter(dialog) -> None:
+            dialog.update()
+            dialog._lmww_on_return()
+
+        result, seen = self.run_dialog(press_enter)
+        self.assertNotIn("timed_out", seen)
+        self.assertTrue(result)
+
+    def test_escape_cancels(self) -> None:
+        result, seen = self.run_dialog(lambda dialog: dialog._lmww_on_escape())
+        self.assertNotIn("timed_out", seen)
+        self.assertFalse(result)
+
+    def test_many_models_fit_on_screen(self) -> None:
+        def close(dialog) -> None:
+            self.buttons(dialog)["Cancel"].invoke()
+
+        result, seen = self.run_dialog(close, self.summary(models=40, files=16))
+        self.assertFalse(result)
+        self.assertLessEqual(seen["height"], seen["screen"])
+
+
+class AlertTriageStateTests(unittest.TestCase):
+    def test_restore_and_set_statuses(self) -> None:
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        state = {"alerts": {"a": {"status": "pending"}, "b": {"status": "pending"}}}
+        state = snooze_alerts(state, now_utc=now, hours=4, model_keys=["a"])
+        state = acknowledge_alerts(state, ["b"])
+        restored = restore_alerts(state, ["a", "b"])
+        self.assertEqual(restored["alerts"]["a"]["status"], "pending")
+        self.assertIsNone(restored["alerts"]["a"]["snoozed_until_utc"])
+        self.assertEqual(restored["alerts"]["b"]["status"], "pending")
+        back = set_alert_statuses(restored, {
+            "a": ("snoozed", "2030-01-01T04:00:00Z"),
+            "b": ("bogus", None),
+            "gone": ("pending", None),
+        })
+        self.assertEqual(back["alerts"]["a"]["status"], "snoozed")
+        self.assertEqual(back["alerts"]["a"]["snoozed_until_utc"], "2030-01-01T04:00:00Z")
+        self.assertEqual(back["alerts"]["b"]["status"], "pending")
+        self.assertNotIn("gone", back["alerts"])
 
 
 if __name__ == "__main__":

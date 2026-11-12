@@ -462,6 +462,39 @@ def snooze_alerts(
     return next_state
 
 
+def restore_alerts(state: dict[str, Any], model_keys: list[str]) -> dict[str, Any]:
+    """Move snoozed or acknowledged alerts back to pending."""
+    next_state = deepcopy(state)
+    targets = set(model_keys)
+    for key, alert in next_state.get("alerts", {}).items():
+        if key in targets:
+            alert["status"] = "pending"
+            alert["snoozed_until_utc"] = None
+    return next_state
+
+
+def set_alert_statuses(
+    state: dict[str, Any],
+    statuses: dict[str, tuple[str | None, str | None]],
+) -> dict[str, Any]:
+    """Put alerts back to recorded (status, snoozed_until_utc) pairs, for undo.
+
+    Alerts that disappeared since the snapshot are skipped; unknown statuses
+    fall back to pending.
+    """
+    next_state = deepcopy(state)
+    alerts = next_state.get("alerts", {})
+    for key, (status, snoozed_until_utc) in statuses.items():
+        alert = alerts.get(key)
+        if not isinstance(alert, dict):
+            continue
+        if status not in {"pending", "snoozed", "acknowledged"}:
+            status = "pending"
+        alert["status"] = status
+        alert["snoozed_until_utc"] = snoozed_until_utc if status == "snoozed" else None
+    return next_state
+
+
 def record_reminder(state: dict[str, Any], now_utc: datetime) -> dict[str, Any]:
     next_state = deepcopy(state)
     next_state["last_reminder_utc"] = format_utc(now_utc)

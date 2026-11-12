@@ -9,9 +9,9 @@ machine.
 `watcher-error.log` ends with:
 
 ```
-File "C:\Users\daniel\VSCodeProjects\LM-Studio-Weight-Updater\lmstudio_weight_watcher.py", line 18, in <module>
+File "C:\Users\<user>\VSCodeProjects\LM-Studio-Weight-Updater\lmstudio_weight_watcher.py", line 18, in <module>
     from PIL import Image, ImageDraw, ImageFont
-  File "C:\Users\daniel\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages\PIL\Image.py", line 95, in <module>
+  File "C:\Users\<user>\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages\PIL\Image.py", line 95, in <module>
     from . import _imaging as core
 ImportError: cannot import name '_imaging' from 'PIL'
 ```
@@ -31,7 +31,7 @@ off, four options are dropped, which is enough to lose `--timeout-seconds` and
 `--state-file`.
 
 Related, and the likely source of the wrong interpreter: `.venv` in this repo
-resolves its standard library to `C:\Users\daniel\miniforge3\Lib`, so it is a
+resolves its standard library to `C:\Users\<user>\miniforge3\Lib`, so it is a
 venv built on a conda base that inherits conda site-packages. That is how a
 broken `PIL` shadows the installed one.
 
